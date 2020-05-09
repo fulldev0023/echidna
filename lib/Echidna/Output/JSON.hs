@@ -22,7 +22,7 @@ data Campaign = Campaign
   , _error :: Maybe String
   , _tests :: [Test]
   , seed :: Int
-  , coverage :: Map String [(Int, TxResult)]
+  , coverage :: Map String [(Int, TxResult, [Int])]
   , gasInfo :: [(Text, (Int, [Tx]))]
   }
 

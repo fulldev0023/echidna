@@ -91,7 +91,7 @@ execTxWith h m t = do
 execTx :: (MonadState x m, Has VM x, MonadThrow m) => Tx -> m (VMResult, Int)
 execTx = execTxWith vmExcept $ liftSH exec
 
-type CoverageMap = Map BS.ByteString (Set (Int, TxResult))
+type CoverageMap = Map BS.ByteString (Set (Int, TxResult, [Int]))
 
 -- | Given a way of capturing coverage info, execute while doing so once per instruction.
 usingCoverage :: (MonadState x m, Has VM x) => m () -> m VMResult
@@ -105,13 +105,13 @@ coveragePoints = sum . fmap S.size
 -- only considering the different instruction PCs (discarding the TxResult).
 -- This is useful to report a coverage measure to the user
 scoveragePoints :: CoverageMap -> Int
-scoveragePoints = sum . fmap (S.size . S.map fst)
+scoveragePoints = sum . fmap (S.size . S.map (\(x,_,_) -> x))
 
 -- | Capture the current PC and bytecode (without metadata). This should identify instructions uniquely.
 pointCoverage :: (MonadState x m, Has VM x) => Lens' x CoverageMap -> m ()
 pointCoverage l = do
   v <- use hasLens
-  l %= M.insertWith (const . S.insert $ (v ^. state . pc, Success))
+  l %= M.insertWith (const . S.insert $ (v ^. state . pc, Success, []))
                     (fromMaybe (error "no contract information on coverage") $ h v)
                     mempty
   where
