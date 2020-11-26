@@ -16,6 +16,7 @@ import qualified Data.HashMap.Strict as H
 
 import EVM (env, contracts, VM)
 import EVM.ABI (AbiValue(AbiAddress))
+import EVM.Solidity (SourceCache, SolcContract)
 
 import Echidna.ABI
 import Echidna.Config
@@ -24,9 +25,9 @@ import Echidna.Types.Campaign
 import Echidna.Types.Random
 import Echidna.Types.Tx
 import Echidna.Types.World
-import Echidna.Transaction
 import Echidna.Processor
 import Echidna.RPC (loadEtheno, extractFromEtheno)
+import Echidna.Output.Corpus
 
 import qualified Data.List.NonEmpty as NE
 
@@ -44,14 +45,14 @@ import qualified Data.List.NonEmpty as NE
 -- * A list of transaction sequences to initialize the corpus
 prepareContract :: (MonadCatch m, MonadRandom m, MonadReader x m, MonadIO m, MonadFail m,
                     Has TxConf x, Has SolConf x)
-                => EConfig -> NE.NonEmpty FilePath -> Maybe String -> Seed -> m (VM, World, [SolTest], Maybe GenDict, [[Tx]])
+                => EConfig -> NE.NonEmpty FilePath -> Maybe String -> Seed -> m (VM, SourceCache, [SolcContract], World, [SolTest], Maybe GenDict, [[Tx]])
 prepareContract cfg fs c g = do
   ctxs <- liftIO $ loadTxs cd
 
   -- compile and load contracts
-  cs <- Echidna.Solidity.contracts fs
+  (cs, sc) <- Echidna.Solidity.contracts fs
   ads <- addresses
-  p <- loadSpecified (pack <$> c) cs
+  p <- loadSpecified (pack <$> c) (cs, sc)
 
   -- run processors
   ca <- view (hasLens . cryticArgs)
@@ -65,17 +66,25 @@ prepareContract cfg fs c g = do
   (v, w, ts) <- prepareForTest p c si
   let ads' = AbiAddress <$> v ^. env . EVM.contracts . to keys
 
+  -- get signatures
+  let sigs = concat $ map (NE.toList . snd) $ H.toList $ w ^. highSignatureMap
+
   -- load transactions from test sample (if any)
   liftIO $ putStrLn "Reading test samples and de-duplicating dataset"
   es <- liftIO $ if (isJust tf) then loadEtheno (fromJust tf) else return []
-  let sigs = concat $ map (NE.toList . snd) $ H.toList $ w ^. highSignatureMap
-  let mtxs = concat $ extractFromEtheno es sigs
+  let stxs = concat $ extractFromEtheno es sigs
 
-  let txs = nub $ ctxs ++ [mtxs]
+  -- load transactions from test sample (if any)
+  liftIO $ putStrLn "Reading test samples and de-duplicating dataset"
+  es' <- liftIO $ if (isJust it) then loadEtheno (fromJust it) else return []
+  let itxs = extractFromEtheno es' sigs
+
+  let txs = nub $ ctxs ++ itxs ++ [stxs]
   liftIO $ putStrLn ("Done. Processed a dataset with " ++ show (length txs) ++ " sequences of transactions")
   
   -- start ui and run tests
-  return (v, w, ts, Just $ mkGenDict df (extractedConstants ++ timeConstants ++ largeConstants ++ NE.toList ads ++ ads') [] g (returnTypes cs), txs)
+  return (v, sc, cs, w, ts, Just $ mkGenDict df (extractedConstants ++ timeConstants ++ largeConstants ++ NE.toList ads ++ ads') [] g (returnTypes cs), txs)
   where cd = cfg ^. cConf . corpusDir
         tf = cfg ^. cConf . testSamples
+        it = cfg ^. sConf . initialize
         df = cfg ^. cConf . dictFreq

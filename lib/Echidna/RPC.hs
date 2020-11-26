@@ -13,7 +13,7 @@ import Control.Monad (foldM)
 import Control.Monad.Catch (MonadThrow, throwM)
 import Control.Monad.IO.Class (MonadIO(..))
 import Control.Monad.Reader.Class (MonadReader(..))
-import Control.Monad.State.Strict (MonadState, execStateT, runStateT, get, put)
+import Control.Monad.State.Strict (MonadState, runStateT, get, put)
 import Data.Aeson (FromJSON(..), (.:), withObject, eitherDecodeFileStrict)
 import Data.Binary.Get (runGetOrFail)
 import Data.ByteString.Char8 (ByteString)
@@ -120,7 +120,7 @@ loadEthenoBatch ts fp = do
          -- Execute contract creations and initial transactions,
          let initVM = foldM (execEthenoTxs ts) Nothing ethenoInit
 
-         (addr, vm') <- runStateT initVM initialVM
+         (_, vm') <- runStateT initVM initialVM
          return vm'
          --case addr of
          --     Nothing -> throwM $ EthenoException "Could not find a contract with echidna tests"
