@@ -132,10 +132,11 @@ execEthenoTxs :: (MonadState x m, Has VM x, MonadThrow m, Has TxConf y, MonadRea
               => [T.Text] -> Maybe Addr -> Etheno -> m (Maybe Addr)
 execEthenoTxs ts addr et = do
   setupEthenoTx et
+  sb <- get
   res <- liftSH exec
   g <- view (hasLens . propGas)
   case (res, et) of
-       (Reversion,   _)               -> throwM $ EthenoException "Encountered reversion while setting up Etheno transactions"
+       (Reversion,   _)               -> put sb >> return addr
        (VMFailure x, _)               -> vmExcept x >> M.fail "impossible"
        (VMSuccess (ConcreteBuffer bc),
         ContractCreated _ ca _ _ _ _) -> do
