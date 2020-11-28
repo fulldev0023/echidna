@@ -85,7 +85,7 @@ markStringLine r (m1: m2 : m3 : ' ': '|':l)  = pack $ case getMarker r of
                                                         m | m3 == m -> m1 :  m2  : m3 : ' ': '|' : l
                                                         m           -> m1 :  m2  : m3 : m  : '|' : l
 
-markStringLine _ (_: _ : _ : _ : '|':_)  = error "impossible to add another marker"
+markStringLine _ l@(_: _ : _ : _ : '|':_)  = pack l --error "impossible to add another marker"
 markStringLine r l = pack $ getMarker r : ' ' : ' ' : ' ': '|' : l
 
 -- | Select the proper marker, according to the result of the transaction
