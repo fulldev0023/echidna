@@ -27,7 +27,7 @@ import System.IO                  (openFile, IOMode(..))
 import System.Exit                (ExitCode(..))
 import System.Directory           (findExecutable)
 
-import Echidna.ABI                (encodeSig, encodeSigWithName, hashSig, fallback, commonTypeSizes, mkValidAbiInt, mkValidAbiUInt)
+import Echidna.ABI                (encodeSig, encodeSigWithName, hashSig, fallback, commonTypeSizes, mkValidAbiInt, mkValidAbiUInt, pregenAdds)
 import Echidna.Exec               (execTx, initialVM)
 import Echidna.Events             (EventMap)
 import Echidna.RPC                (loadEthenoBatch)
@@ -229,8 +229,9 @@ loadSpecified name (cs,_) = do
 
   --liftIO $ print $ view EVM.contracts $ view env blank'
   --error "end"
-  let blank = populateAddresses (NE.toList ads |> d) bala blank'
-
+  let blank'' = populateAddresses (NE.toList ads |> d) bala blank'
+  let blank = populateAddresses pregenAdds 0 blank''
+ 
   unless (null con || isJust fp) (throwM $ ConstructorArgs (show con))
   -- Select libraries
   ls <- mapM (choose cs . Just . T.pack) libs
