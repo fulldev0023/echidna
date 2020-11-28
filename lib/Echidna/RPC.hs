@@ -48,6 +48,8 @@ import Echidna.Types.Tx (TxCall(..), Tx(..), TxConf, makeSingleTx, basicTx, crea
 data Etheno = AccountCreated Addr                                       -- ^ Registers an address with the echidna runtime
             | ContractCreated Addr Addr Integer Integer ByteString W256 -- ^ A contract was constructed on the blockchain
             | FunctionCall Addr Addr Integer Integer ByteString W256    -- ^ A contract function was executed
+            | BlockMined Integer Integer                                -- ^ A new block was mined contract
+ 
   deriving (Eq, Show)
 
 instance FromJSON Etheno where
@@ -55,6 +57,8 @@ instance FromJSON Etheno where
     (ev :: String) <- v .: "event"
     let gu = maybe (M.fail "could not parse gas_used") pure . readMaybe =<< v .: "gas_used"
         gp = maybe (M.fail "could not parse gas_price") pure . readMaybe =<< v .: "gas_price"
+        ni = maybe (M.fail "could not parse number_increase") pure . readMaybe =<< v .: "number_increment"
+        ti = maybe (M.fail "could not parse timestamp_increase") pure . readMaybe =<< v .: "timestamp_increment"
     case ev of
          "AccountCreated"  -> AccountCreated  <$> v .: "address"
          "ContractCreated" -> ContractCreated <$> v .: "from"
@@ -69,6 +73,9 @@ instance FromJSON Etheno where
                                               <*> gp
                                               <*> (decode =<< (v .: "data"))
                                               <*> v .: "value"
+         "BlockMined"      -> BlockMined      <$> ni
+                                              <*> ti
+ 
          _ -> M.fail "event should be one of \"AccountCreated\", \"ContractCreated\", or \"FunctionCall\""
     where decode x = case BS16.decode . encodeUtf8 . T.drop 2 $ x of
                           (a, "") -> pure a
@@ -105,6 +112,8 @@ matchSignatureAndCreateTx (s,ts) (FunctionCall a d _ _ bs v) = if (BS.take 4 bs)
   where t = AbiTupleType (V.fromList ts)
         fromTuple (AbiTuple xs) = V.toList xs
         fromTuple _            = []
+
+matchSignatureAndCreateTx _ (BlockMined ni ti)               = Just $ [Tx NoCall 0 0 0 0 0 (fromInteger ni, fromInteger ti)]
 matchSignatureAndCreateTx _ _                                = Nothing 
 
 -- | Main function: takes a filepath where the initialization sequence lives and returns
@@ -148,7 +157,7 @@ execEthenoTxs ts addr et = do
                -- found the tests, so just return the contract
                Just m  -> return $ Just m
                -- try to see if this is the contract we wish to test
-               Nothing -> let txs = ts <&> \t -> basicTx t [] ca ca g
+               Nothing -> let txs = ts <&> \t -> basicTx t [] ca ca g (0, 0)
                               -- every test was executed successfully
                               go []     = return (Just ca)
                               -- execute x and check if it returned something of the correct type
@@ -172,5 +181,6 @@ execEthenoTxs ts addr et = do
 -- | For an etheno txn, set up VM to execute txn
 setupEthenoTx :: (MonadState x m, Has VM x) => Etheno -> m ()
 setupEthenoTx (AccountCreated _) = pure ()
-setupEthenoTx (ContractCreated f c _ _ d v) = setupTx $ createTxWithValue d f c unlimitedGasPerBlock (w256 v)
-setupEthenoTx (FunctionCall f t _ _ d v) = setupTx $ Tx (SolCalldata d) f t unlimitedGasPerBlock 0 (w256 v) (0, 0)
+setupEthenoTx (ContractCreated f c _ _ d v) = setupTx $ createTxWithValue d f c unlimitedGasPerBlock (w256 v) (1, 1)
+setupEthenoTx (FunctionCall f t _ _ d v) = setupTx $ Tx (SolCalldata d) f t unlimitedGasPerBlock 0 (w256 v) (1, 1)
+setupEthenoTx (BlockMined n t) = setupTx $ Tx NoCall 0 0 0 0 0 (fromInteger n, fromInteger t)

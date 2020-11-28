@@ -57,37 +57,41 @@ data Tx = Tx { _call  :: TxCall       -- | Call
 makeLenses ''Tx
 $(deriveJSON defaultOptions ''Tx)
 
-basicTx :: Text       -- | Function name
-        -> [AbiValue] -- | Function args
-        -> Addr       -- | msg.sender
-        -> Addr       -- | Destination contract
-        -> Word       -- | Gas limit
+basicTx :: Text         -- | Function name
+        -> [AbiValue]   -- | Function args
+        -> Addr         -- | msg.sender
+        -> Addr         -- | Destination contract
+        -> Word         -- | Gas limit
+        -> (Word, Word) -- | Block increment
         -> Tx
-basicTx f a s d g = basicTxWithValue f a s d g 0
+basicTx f a s d g b = basicTxWithValue f a s d g 0 b
 
-basicTxWithValue :: Text       -- | Function name
-                 -> [AbiValue] -- | Function args
-                 -> Addr       -- | msg.sender
-                 -> Addr       -- | Destination contract
-                 -> Word       -- | Gas limit
-                 -> Word       -- | Value
+basicTxWithValue :: Text         -- | Function name
+                 -> [AbiValue]   -- | Function args
+                 -> Addr         -- | msg.sender
+                 -> Addr         -- | Destination contract
+                 -> Word         -- | Gas limit
+                 -> Word         -- | Value
+                 -> (Word, Word) -- | Block increment
                  -> Tx
-basicTxWithValue f a s d g v = Tx (SolCall (f, a)) s d g 0 v (0, 0)
+basicTxWithValue f a s d g v b = Tx (SolCall (f, a)) s d g 0 v b
 
-createTx :: ByteString  -- | Constructor bytecode
-         -> Addr        -- | Creator
-         -> Addr        -- | Destination address
-         -> Word        -- | Gas limit
+createTx :: ByteString   -- | Constructor bytecode
+         -> Addr         -- | Creator
+         -> Addr         -- | Destination address
+         -> Word         -- | Gas limit
+         -> (Word, Word) -- | Block increment
          -> Tx
-createTx bc s d g = createTxWithValue bc s d g 0
+createTx bc s d g b = createTxWithValue bc s d g 0 b
 
 createTxWithValue :: ByteString  -- | Constructor bytecode
                   -> Addr        -- | Creator
                   -> Addr        -- | Destination address
                   -> Word        -- | Gas limit
                   -> Word        -- | Value
+                  -> (Word, Word) -- | Block increment
                   -> Tx
-createTxWithValue bc s d g v = Tx (SolCreate bc) s d g 0 v (0, 0)
+createTxWithValue bc s d g v b = Tx (SolCreate bc) s d g 0 v b
 
 data TxResult = Success
               | ErrorBalanceTooLow 

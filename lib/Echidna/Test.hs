@@ -70,7 +70,7 @@ checkETest em t = do
     -- If our test is a regular user-defined test, we exec it and check the result
     Left (f, a) -> do
       sd <- hasSelfdestructed a
-      _  <- execTx $ basicTx f [] (s a) a g
+      _  <- execTx $ basicTx f [] (s a) a g (0, 0)
       b  <- gets $ p f . getter
       pure $ not sd && b
     -- If our test is an auto-generated assertion test, we check if we failed an assert on that fn
