@@ -106,12 +106,13 @@ extractFromEtheno es ss = nub $ catMaybes $ concatMap f ss
 
 matchSignatureAndCreateTx :: SolSignature -> Etheno -> Maybe [Tx]
 matchSignatureAndCreateTx ("", []) _ = Nothing -- Not sure if we should match this.
-matchSignatureAndCreateTx (s,ts) (FunctionCall a d _ _ bs v) = if (BS.take 4 bs) == (selector $ encodeSig (s,ts)) 
-                                                                   then Just $ makeSingleTx a d v $ SolCall (s, fromTuple $ decodeAbiValue t (LBS.fromStrict bs)) 
-                                                                   else Nothing
+matchSignatureAndCreateTx (s,ts) (FunctionCall a d _ _ bs v) = if (BS.take 4 bs) == (selector $ encodeSig (s,ts))
+                                                               then Just $ makeSingleTx a d v $ SolCall (s, fromTuple $ decodeAbiValue t (LBS.fromStrict $ BS.drop 4 bs)) 
+                                                               else Nothing
   where t = AbiTupleType (V.fromList ts)
         fromTuple (AbiTuple xs) = V.toList xs
         fromTuple _            = []
+
 
 matchSignatureAndCreateTx _ (BlockMined ni ti)               = Just $ [Tx NoCall 0 0 0 0 0 (fromInteger ti, fromInteger ni)]
 matchSignatureAndCreateTx _ _                                = Nothing 

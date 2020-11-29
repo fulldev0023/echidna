@@ -74,7 +74,7 @@ prepareContract cfg fs c g = do
   es <- liftIO $ if (isJust tf) then loadEtheno (fromJust tf) else return []
   let stxs = concat $ extractFromEtheno es sigs
 
-  -- load transactions from test sample (if any)
+  -- load transactions from init sample (if any)
   es' <- liftIO $ if (isJust it) then loadEtheno (fromJust it) else return []
   let itxs = concat $ extractFromEtheno es' sigs
 
