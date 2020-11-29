@@ -33,6 +33,7 @@ import qualified Data.Text as T (Text, drop, unpack)
 import qualified Data.Vector as V (fromList, toList)
 import qualified Data.ByteString.Char8 as BS
 import qualified Data.ByteString.Lazy as LBS
+import qualified Data.List.NonEmpty as NE
 
 import Echidna.Exec
 import Echidna.Transaction
@@ -115,6 +116,11 @@ matchSignatureAndCreateTx (s,ts) (FunctionCall a d _ _ bs v) = if (BS.take 4 bs)
         fromTuple _            = []
 
 matchSignatureAndCreateTx _ _                                = [] 
+
+checkSenderAndReplace :: NE.NonEmpty Addr -> Tx -> Tx
+checkSenderAndReplace ss t@(Tx sc s r a b c d) = if s `elem` ss 
+                                  then t
+                                  else (Tx sc (NE.head ss) r a b c d)
 
 -- | Main function: takes a filepath where the initialization sequence lives and returns
 -- | the initialized VM along with a list of Addr's to put in GenConf

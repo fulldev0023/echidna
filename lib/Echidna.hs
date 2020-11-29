@@ -26,7 +26,7 @@ import Echidna.Types.Random
 import Echidna.Types.Tx
 import Echidna.Types.World
 import Echidna.Processor
-import Echidna.RPC (loadEtheno, extractFromEtheno)
+import Echidna.RPC (loadEtheno, extractFromEtheno, checkSenderAndReplace)
 import Echidna.Output.Corpus
 
 import qualified Data.List.NonEmpty as NE
@@ -78,7 +78,7 @@ prepareContract cfg fs c g = do
   es' <- liftIO $ if (isJust it) then loadEtheno (fromJust it) else return []
   let itxs = extractFromEtheno es' sigs
 
-  let txs = nub $ ctxs ++ [itxs] ++ [stxs]
+  let txs = nub $ ctxs ++ [map (checkSenderAndReplace ss) itxs] ++ [map (checkSenderAndReplace ss) stxs]
   liftIO $ putStrLn ("Done. Processed a dataset with " ++ show (length txs) ++ " sequences of transactions")
   
   -- start ui and run tests
@@ -86,4 +86,5 @@ prepareContract cfg fs c g = do
   where cd = cfg ^. cConf . corpusDir
         tf = cfg ^. cConf . testSamples
         it = cfg ^. sConf . initialize
+        ss = cfg ^. sConf . sender
         df = cfg ^. cConf . dictFreq
