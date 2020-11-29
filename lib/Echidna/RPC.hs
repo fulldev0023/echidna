@@ -113,7 +113,7 @@ matchSignatureAndCreateTx (s,ts) (FunctionCall a d _ _ bs v) = if (BS.take 4 bs)
         fromTuple (AbiTuple xs) = V.toList xs
         fromTuple _            = []
 
-matchSignatureAndCreateTx _ (BlockMined ni ti)               = Just $ [Tx NoCall 0 0 0 0 0 (fromInteger ni, fromInteger ti)]
+matchSignatureAndCreateTx _ (BlockMined ni ti)               = Just $ [Tx NoCall 0 0 0 0 0 (fromInteger ti, fromInteger ni)]
 matchSignatureAndCreateTx _ _                                = Nothing 
 
 -- | Main function: takes a filepath where the initialization sequence lives and returns
@@ -183,4 +183,4 @@ setupEthenoTx :: (MonadState x m, Has VM x) => Etheno -> m ()
 setupEthenoTx (AccountCreated _) = pure ()
 setupEthenoTx (ContractCreated f c _ _ d v) = setupTx $ createTxWithValue d f c unlimitedGasPerBlock (w256 v) (1, 1)
 setupEthenoTx (FunctionCall f t _ _ d v) = setupTx $ Tx (SolCalldata d) f t unlimitedGasPerBlock 0 (w256 v) (1, 1)
-setupEthenoTx (BlockMined n t) = setupTx $ Tx NoCall 0 0 0 0 0 (fromInteger n, fromInteger t)
+setupEthenoTx (BlockMined n t) = setupTx $ Tx NoCall 0 0 0 0 0 (fromInteger t, fromInteger n)

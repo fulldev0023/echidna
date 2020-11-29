@@ -75,11 +75,10 @@ prepareContract cfg fs c g = do
   let stxs = concat $ extractFromEtheno es sigs
 
   -- load transactions from test sample (if any)
-  liftIO $ putStrLn "Reading test samples and de-duplicating dataset"
   es' <- liftIO $ if (isJust it) then loadEtheno (fromJust it) else return []
-  let itxs = extractFromEtheno es' sigs
+  let itxs = concat $ extractFromEtheno es' sigs
 
-  let txs = nub $ ctxs ++ itxs ++ [stxs]
+  let txs = nub $ ctxs ++ [itxs] ++ [stxs]
   liftIO $ putStrLn ("Done. Processed a dataset with " ++ show (length txs) ++ " sequences of transactions")
   
   -- start ui and run tests
