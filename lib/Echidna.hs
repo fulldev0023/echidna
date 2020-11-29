@@ -67,16 +67,16 @@ prepareContract cfg fs c g = do
   let ads' = AbiAddress <$> v ^. env . EVM.contracts . to keys
 
   -- get signatures
-  let sigs = concat $ map (NE.toList . snd) $ H.toList $ w ^. highSignatureMap
+  let sigs = nub $ concat $ map (NE.toList . snd) $ H.toList $ w ^. highSignatureMap
 
   -- load transactions from test sample (if any)
   liftIO $ putStrLn "Reading test samples and de-duplicating dataset"
   es <- liftIO $ if (isJust tf) then loadEtheno (fromJust tf) else return []
-  let stxs = concat $ extractFromEtheno es sigs
+  let stxs = extractFromEtheno es sigs
 
-  -- load transactions from init sample (if any)
+  -- load transactions from init sequence (if any)
   es' <- liftIO $ if (isJust it) then loadEtheno (fromJust it) else return []
-  let itxs = concat $ extractFromEtheno es' sigs
+  let itxs = extractFromEtheno es' sigs
 
   let txs = nub $ ctxs ++ [itxs] ++ [stxs]
   liftIO $ putStrLn ("Done. Processed a dataset with " ++ show (length txs) ++ " sequences of transactions")

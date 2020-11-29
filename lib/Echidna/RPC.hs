@@ -20,8 +20,6 @@ import Data.ByteString.Char8 (ByteString)
 import Data.Has (Has(..))
 import Data.Text.Encoding (encodeUtf8)
 
-import Data.Maybe (catMaybes)
-import Data.List (nub)
 import EVM
 import EVM.ABI (AbiType(..), AbiValue(..), decodeAbiValue, getAbi, selector)
 import EVM.Concrete (w256)
@@ -100,22 +98,23 @@ loadEtheno fp = do
        (Left e) -> throwM $ EthenoException e
        (Right (ethenoInit :: [Etheno])) -> return ethenoInit
 
-extractFromEtheno :: [Etheno] -> [SolSignature] -> [[Tx]]
-extractFromEtheno es ss = nub $ catMaybes $ concatMap f ss
-  where f s = map (matchSignatureAndCreateTx s) es 
+extractFromEtheno :: [Etheno] -> [SolSignature] -> [Tx]
+extractFromEtheno ess ss = case ess of 
+                           ((BlockMined ni ti):es)           -> (Tx NoCall 0 0 0 0 0 (fromInteger ti, fromInteger ni)) : extractFromEtheno es ss
+                           (c@(FunctionCall _ _ _ _ _ _):es) -> concat (map (\s -> matchSignatureAndCreateTx s c) ss) ++ extractFromEtheno es ss
+                           (_:es)                            -> extractFromEtheno es ss
+                           _                                 -> []
 
-matchSignatureAndCreateTx :: SolSignature -> Etheno -> Maybe [Tx]
-matchSignatureAndCreateTx ("", []) _ = Nothing -- Not sure if we should match this.
+matchSignatureAndCreateTx :: SolSignature -> Etheno -> [Tx]
+matchSignatureAndCreateTx ("", []) _ = [] -- Not sure if we should match this.
 matchSignatureAndCreateTx (s,ts) (FunctionCall a d _ _ bs v) = if (BS.take 4 bs) == (selector $ encodeSig (s,ts))
-                                                               then Just $ makeSingleTx a d v $ SolCall (s, fromTuple $ decodeAbiValue t (LBS.fromStrict $ BS.drop 4 bs)) 
-                                                               else Nothing
+                                                               then makeSingleTx a d v $ SolCall (s, fromTuple $ decodeAbiValue t (LBS.fromStrict $ BS.drop 4 bs)) 
+                                                               else []
   where t = AbiTupleType (V.fromList ts)
         fromTuple (AbiTuple xs) = V.toList xs
         fromTuple _            = []
 
-
-matchSignatureAndCreateTx _ (BlockMined ni ti)               = Just $ [Tx NoCall 0 0 0 0 0 (fromInteger ti, fromInteger ni)]
-matchSignatureAndCreateTx _ _                                = Nothing 
+matchSignatureAndCreateTx _ _                                = [] 
 
 -- | Main function: takes a filepath where the initialization sequence lives and returns
 -- | the initialized VM along with a list of Addr's to put in GenConf
