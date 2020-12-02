@@ -216,7 +216,7 @@ loadSpecified name (cs,_) = do
   
   -- Construct ABI mapping for World
 
-  let abiMapping = if ma then M.fromList $ cs <&> \cc -> (getBytecodeMetadata $ c ^. runtimeCode, filterMethods (cc ^. contractName) fs $ abiOf pref cc)
+  let abiMapping = if ma then M.fromList $ cs <&> \cc -> (getBytecodeMetadata $ cc ^. runtimeCode, filterMethods (cc ^. contractName) fs $ abiOf pref cc)
                          else M.singleton (getBytecodeMetadata $ c ^. runtimeCode) fabiOfc
   
   -- Set up initial VM, either with chosen contract or Etheno initialization file
