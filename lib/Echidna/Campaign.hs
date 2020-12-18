@@ -187,7 +187,7 @@ seqMutators (c1, c2, c3) =
           let somePercent = if (fst . DS.findMax) ctxs > 1    -- if the corpus already contains new elements
                              then 1 + (DS.size ctxs `div` 20) -- then take 5% of its size
                              else DS.size ctxs                -- otherwise, take all of it
-          rtxs <- fromList $ map (\(i, txs) -> (txs, fromInteger i)) $ take somePercent $ DS.toDescList ctxs
+          rtxs <- fromList $ map (\(i, txs) -> (txs, fromInteger i)) {- $ take somePercent -} $ DS.toDescList ctxs
           k <- getRandomR (0, length rtxs - 1)
           return . take ql $ if flp then take k gtxs ++ rtxs else take k rtxs ++ gtxs
 
