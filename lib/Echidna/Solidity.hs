@@ -215,7 +215,6 @@ loadSpecified name (cs,_) = do
   let neFuns = filterMethods (c ^. contractName) fs (fallback NE.:| funs)
   
   -- Construct ABI mapping for World
-
   let abiMapping = if ma then M.fromList $ cs <&> \cc -> (getBytecodeMetadata $ cc ^. runtimeCode, filterMethods (cc ^. contractName) fs $ abiOf pref cc)
                          else M.singleton (getBytecodeMetadata $ c ^. runtimeCode) fabiOfc
   
