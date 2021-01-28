@@ -18,7 +18,6 @@ import Data.Tuple.Extra (fst3)
 import EVM
 import EVM.Op (Op(..))
 import EVM.Exec (exec, vmForEthrunCreation)
-import EVM.Solidity --(SourceCache, SrcMap, SolcContract, contractName, sourceLines, sourceFiles, runtimeCode, runtimeSrcmap, creationSrcmap)
 import EVM.Types (Buffer(..))
 import EVM.Symbolic (litWord)
 
@@ -30,6 +29,7 @@ import Echidna.Transaction
 import Echidna.Types.Tx (TxCall(..), Tx, TxResult(..), call, dst, initialTimestamp, initialBlockNumber)
 import Echidna.Types.Signature (getBytecodeMetadata)
 import Echidna.Events (emptyEvents)
+
 
 -- | Broad categories of execution failures: reversions, illegal operations, and ???.
 data ErrorClass = RevertE | IllegalE | UnknownE
