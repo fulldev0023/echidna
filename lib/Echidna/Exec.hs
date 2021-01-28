@@ -100,7 +100,12 @@ execTxWith h m t = do
 execTx :: (MonadState x m, Has VM x, MonadThrow m) => Tx -> m (VMResult, Int)
 execTx = execTxWith vmExcept $ liftSH exec
 
-type CoverageMap = Map BS.ByteString (Set (Int, Int, TxResult))
+-- Program Counter directly obtained from the EVM
+type PC = Int
+-- Index per operation in the source code, obtained from the source mapping 
+type OpIx = Int
+-- Map with the coverage information needed for fuzzing and source code printing 
+type CoverageMap = Map BS.ByteString (Set (PC, OpIx, TxResult))
 
 -- | Given a way of capturing coverage info, execute while doing so once per instruction.
 usingCoverage :: (MonadState x m, Has VM x) => m () -> m VMResult
