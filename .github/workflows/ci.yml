@@ -81,11 +81,11 @@ jobs:
 
       - name: Build Dependencies
         run: |
-          stack build --ghc-options="-Werror" --extra-include-dirs=$HOME/.local/include --extra-lib-dirs=$HOME/.local/lib --only-dependencies
+          stack build  --extra-include-dirs=$HOME/.local/include --extra-lib-dirs=$HOME/.local/lib --only-dependencies
 
       - name: Build and install echidna
         run: |
-          stack install --ghc-options="-Werror" --extra-include-dirs=$HOME/.local/include --extra-lib-dirs=$HOME/.local/lib
+          stack install --extra-include-dirs=$HOME/.local/include --extra-lib-dirs=$HOME/.local/lib
 
       - name: Test
         if: runner.os == 'Linux'
@@ -95,7 +95,7 @@ jobs:
 
           for VER in "0.4.25" "0.5.7" ; do
             cp "$HOME/.local/bin/solc-$VER" "$HOME/.local/bin/solc"
-            stack test --ghc-options="-Werror" --extra-include-dirs=$HOME/.local/include --extra-lib-dirs=$HOME/.local/lib
+            stack test --extra-include-dirs=$HOME/.local/include --extra-lib-dirs=$HOME/.local/lib
           done
 
       - name: Amend and compress binaries (macOS)
