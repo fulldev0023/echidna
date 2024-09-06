@@ -1,3 +1,23 @@
+## 2.2.2
+
+* Save corpus and reproducers continuously (#1167)
+* Deliver status information using server-sent events (#1131)
+* Performance improvements for coverage collection (#1160)
+* Make slither optional (#1159)
+* Rich trace printing (#1157)
+* Static builds and release workflow (#1133)
+* Re-enables using slither for vyper files (#1108)
+* Dependency updates (#1153, #1096, #1154)
+
+## 2.2.1
+
+* Shanghai fork support with hevm 0.51.3 (#1090)
+* Fixed coverage collection for delegatecalls (#1083)
+* Added events to JSON output (#1069)
+* Changed event sequence to be displayed on new lines (#1079)
+* Improved "No tests found in ABI" error message (#1077)
+* Refactored code (#1070, #1074)
+
 ## 2.2.0
 
 * Multicore fuzzing (#963, #1033, #1026, #1035)

@@ -3,7 +3,7 @@ name: echidna
 author: Trail of Bits <echidna-dev@trailofbits.com>
 maintainer: Trail of Bits <echidna-dev@trailofbits.com>
 
-version: 2.2.0
+version: 2.2.2
 
 # https://github.com/haskell/cabal/issues/4739
 ghc-options: -Wall -fno-warn-orphans -O2 -optP-Wno-nonportable-include-path
@@ -48,7 +48,10 @@ dependencies:
   - yaml
   - http-conduit
   - html-conduit
+  - warp
+  - wai-extra
   - xml-conduit
+  - strip-ansi-escape
 
 language: GHC2021
 
@@ -89,7 +92,10 @@ executables:
       - condition: os(darwin)
         extra-libraries: c++
         ld-options: -Wl,-keep_dwarf_unwind
-      - condition: os(windows)
+        ghc-options: -fcompact-unwind
+      - condition: os(windows) && impl(ghc >= 9.4)
+        dependencies: system-cxx-std-lib
+      - condition: os(windows) && impl(ghc < 9.4)
         extra-libraries: stdc++
 
 tests:
@@ -112,7 +118,10 @@ tests:
         - condition: os(darwin)
           extra-libraries: c++
           ld-options: -Wl,-keep_dwarf_unwind
-        - condition: os(windows)
+          ghc-options: -fcompact-unwind
+        - condition: os(windows) && impl(ghc >= 9.4)
+          dependencies: system-cxx-std-lib
+        - condition: os(windows) && impl(ghc < 9.4)
           extra-libraries: stdc++
 
 flags:

@@ -2,19 +2,21 @@ module Echidna.Solidity where
 
 import Optics.Core hiding (filtered)
 
-import Control.Arrow (first)
+import Control.Concurrent (ThreadId)
+import Control.Concurrent.MVar (MVar)
 import Control.Monad (when, unless, forM_)
 import Control.Monad.Catch (MonadThrow(..))
 import Control.Monad.Extra (whenM)
 import Control.Monad.Reader (ReaderT(runReaderT))
+import Control.Monad.ST (stToIO, RealWorld)
 import Data.Foldable (toList)
 import Data.List (find, partition, isSuffixOf, (\\))
 import Data.List.NonEmpty (NonEmpty((:|)))
 import Data.List.NonEmpty qualified as NE
 import Data.List.NonEmpty.Extra qualified as NEE
-import Data.Map (Map, keys, unions, member)
+import Data.Map (Map)
 import Data.Map qualified as Map
-import Data.Maybe (isJust, isNothing, catMaybes, listToMaybe)
+import Data.Maybe (isJust, isNothing, catMaybes, listToMaybe, mapMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text, isPrefixOf, isSuffixOf, append)
@@ -27,10 +29,11 @@ import System.FilePath (joinPath, splitDirectories, (</>))
 import System.IO (openFile, IOMode(..))
 import System.Info (os)
 
-import EVM hiding (Env)
+import EVM (initialContract, currentContract)
 import EVM.ABI
+import EVM.Dapp (DappInfo(..))
 import EVM.Solidity
-import EVM.Types (Addr, FunctionSelector)
+import EVM.Types hiding (Env)
 
 import Echidna.ABI
   ( encodeSig, encodeSigWithName, hashSig, fallback
@@ -39,44 +42,31 @@ import Echidna.Deploy (deployContracts, deployBytecodes)
 import Echidna.Etheno (loadEthenoBatch)
 import Echidna.Events (EventMap, extractEvents)
 import Echidna.Exec (execTx, initialVM)
-import Echidna.Processor
+import Echidna.SourceAnalysis.Slither
+import Echidna.Symbolic (forceAddr)
+import Echidna.SymExec qualified
 import Echidna.Test (createTests, isAssertionMode, isPropertyMode, isDapptestMode)
 import Echidna.Types.Config (EConfig(..), Env(..))
 import Echidna.Types.Signature
-  (ContractName, SolSignature, SignatureMap, getBytecodeMetadata)
+  (ContractName, SolSignature, SignatureMap, FunctionName)
 import Echidna.Types.Solidity
 import Echidna.Types.Test (EchidnaTest(..))
 import Echidna.Types.Tx
   ( basicTx, createTxWithValue, unlimitedGasPerBlock, initialTimestamp
-  , initialBlockNumber )
+  , initialBlockNumber, Tx )
 import Echidna.Types.World (World(..))
 import Echidna.Utility (measureIO)
 
--- | Given a list of source caches (SourceCaches) and an optional contract name,
--- select one that includes that contract (if possible). Otherwise, use the first source
--- cache available (or fail if it is empty)
-selectSourceCache :: Maybe ContractName -> SourceCaches -> SourceCache
-selectSourceCache (Just c) scs =
-  let
-    r = concatMap (\(cs,sc) ->
-          [sc | isJust $ find (Data.Text.isSuffixOf (":" <> c)) cs]
-        ) scs
-  in case r of
-    (sc:_) -> sc
-    _      -> error "Source cache selection returned no result"
-
-selectSourceCache _ scs =
-  case scs of
-    (_,sc):_ -> sc
-    _        -> error "Empty source cache"
-
-readSolcBatch :: FilePath -> IO (Maybe (Map Text SolcContract, SourceCaches))
+readSolcBatch :: FilePath -> IO [BuildOutput]
 readSolcBatch d = do
-  fs <- listDirectory d
-  mxs <- mapM (\f -> readSolc (d </> f)) fs
-  case catMaybes mxs of
-    [] -> return Nothing
-    xs -> return $ Just (unions $ map fst xs, map (first keys) xs)
+  fs <- filter (".json" `Data.List.isSuffixOf`) <$> listDirectory d
+  mapM parseOne fs
+  where
+  parseOne f =
+    readSolc CombinedJSON "" (d </> f) >>= \case
+      Right buildOutput -> pure buildOutput
+      Left e ->
+        error $ "Failed to parse combined JSON file " <> (d </> f) <> "\n" <> e
 
 -- | Given a list of files, use its extenstion to check if it is a precompiled
 -- contract or try to compile it and get a list of its contracts and a list of source
@@ -84,7 +74,7 @@ readSolcBatch d = do
 compileContracts
   :: SolConf
   -> NonEmpty FilePath
-  -> IO ([SolcContract], SourceCaches)
+  -> IO BuildOutput
 compileContracts solConf fp = do
   path <- findExecutable "crytic-compile" >>= \case
     Nothing -> throwM NoCryticCompile
@@ -94,31 +84,24 @@ compileContracts solConf fp = do
     usual = ["--solc-disable-warnings", "--export-format", "solc"]
     solargs = solConf.solcArgs ++ linkLibraries solConf.solcLibs & (usual ++) .
               (\sa -> if null sa then [] else ["--solc-args", sa])
-    compileOne :: FilePath -> IO ([SolcContract], SourceCaches)
+    compileOne :: FilePath -> IO BuildOutput
     compileOne x = do
-      mSolc <- do
-        stderr <- if solConf.quiet
-                     then UseHandle <$> openFile nullFilePath WriteMode
-                     else pure Inherit
-        (ec, out, err) <- measureIO solConf.quiet ("Compiling " <> x) $ do
-          readCreateProcessWithExitCode
-            (proc path $ (solConf.cryticArgs ++ solargs) |> x) {std_err = stderr} ""
-        case ec of
-          ExitSuccess -> readSolcBatch "crytic-export"
-          ExitFailure _ -> throwM $ CompileFailure out err
+      stderr <- if solConf.quiet
+                   then UseHandle <$> openFile nullFilePath WriteMode
+                   else pure Inherit
+      (ec, out, err) <- measureIO solConf.quiet ("Compiling " <> x) $ do
+        readCreateProcessWithExitCode
+          (proc path $ (solConf.cryticArgs ++ solargs) |> x) {std_err = stderr} ""
+      case ec of
+        ExitSuccess -> mconcat <$> readSolcBatch "crytic-export"
+        ExitFailure _ -> throwM $ CompileFailure out err
 
-      maybe (throwM SolcReadFailure) (pure . first toList) mSolc
     -- | OS-specific path to the "null" file, which accepts writes without storing them
     nullFilePath :: String
     nullFilePath = if os == "mingw32" then "\\\\.\\NUL" else "/dev/null"
   -- clean up previous artifacts
   removeJsonFiles "crytic-export"
-  cps <- mapM compileOne fp
-  let (cs, ss) = NE.unzip cps
-  when (length ss > 1) $
-    putStrLn "WARNING: more than one SourceCaches was found after compile. \
-             \Only the first one will be used."
-  pure (concat cs, NE.head ss)
+  mconcat . NE.toList <$> mapM compileOne fp
 
 removeJsonFiles :: FilePath -> IO ()
 removeJsonFiles dir =
@@ -134,18 +117,19 @@ staticAddresses SolConf{contractAddr, deployer, sender} =
   Set.map AbiAddress $
     Set.union sender (Set.fromList [contractAddr, deployer, 0x0])
 
-populateAddresses :: Set Addr -> Integer -> VM -> VM
+populateAddresses :: Set Addr -> Integer -> VM s -> VM s
 populateAddresses addrs b vm =
   Set.foldl' (\vm' addr ->
     if deployed addr
        then vm'
-       else vm' & set (#env % #contracts % at addr) (Just account)
+       else vm' & set (#env % #contracts % at (LitAddr addr)) (Just account)
   ) vm addrs
   where
     account =
-      (initialContract (RuntimeCode (ConcreteRuntimeCode mempty)))
-        { nonce = 0, balance = fromInteger b }
-    deployed addr = addr `member` vm.env.contracts
+      initialContract (RuntimeCode (ConcreteRuntimeCode mempty))
+        & set #nonce (Just 0)
+        & set #balance (Lit $ fromInteger b)
+    deployed addr = LitAddr addr `Map.member` vm.env.contracts
 
 -- | Address to load the first library
 addrLibrary :: Addr
@@ -178,6 +162,24 @@ abiOf pref solcContract =
     filter (not . isPrefixOf pref . fst)
            (Map.elems solcContract.abiMap <&> \method -> (method.name, snd <$> method.inputs))
 
+createSymTx :: Env -> Maybe Text -> [SolcContract] -> VM RealWorld -> IO (ThreadId, MVar [Tx])
+createSymTx env name cs vm = do
+    mainContract <- choose cs name
+    Echidna.SymExec.exploreContract env.cfg mainContract vm
+  where
+    -- copied from loadSpecified
+    choose [] _ = throwM NoContracts
+    choose (c:_) Nothing = pure c
+    choose _ (Just n) =
+      maybe (throwM $ ContractNotFound n) pure $
+        find (Data.Text.isSuffixOf (contractId n) . (.contractName)) cs
+    contractId n
+      | T.any (== ':') n =
+        let (splitPath, splitName) = T.breakOn ":" n
+        in rewritePathSeparators splitPath `T.append` splitName
+      | otherwise = ":" `append` n
+    rewritePathSeparators = T.pack . joinPath . splitDirectories . T.unpack
+
 -- | Given an optional contract name and a list of 'SolcContract's, try to load the specified
 -- contract, or, if not provided, the first contract in the list, into a 'VM' usable for Echidna
 -- testing and extract an ABI and list of tests. Throws exceptions if anything returned doesn't look
@@ -187,7 +189,7 @@ loadSpecified
   :: Env
   -> Maybe Text
   -> [SolcContract]
-  -> IO (VM, [SolSignature], [Text], SignatureMap)
+  -> IO (VM RealWorld, [SolSignature], [Text], SignatureMap)
 loadSpecified env name cs = do
   let solConf = env.cfg.solConf
 
@@ -213,21 +215,22 @@ loadSpecified env name cs = do
     -- Construct ABI mapping for World
     abiMapping =
       if solConf.allContracts then
-        Map.fromList $ catMaybes $ cs <&> \contract ->
-          let filtered = filterMethods contract.contractName
-                                       solConf.methodFilter
-                                       (abiOf solConf.prefix contract)
-          in (getBytecodeMetadata contract.runtimeCode,) <$> NE.nonEmpty filtered
+        Map.fromList $ mapMaybe (\contract ->
+            let filtered = filterMethods contract.contractName
+                                         solConf.methodFilter
+                                         (abiOf solConf.prefix contract)
+            in (contract.runtimeCodehash,) <$> NE.nonEmpty filtered)
+          cs
       else
         case NE.nonEmpty fabiOfc of
-          Just ne -> Map.singleton (getBytecodeMetadata mainContract.runtimeCode) ne
+          Just ne -> Map.singleton mainContract.runtimeCodehash ne
           Nothing -> mempty
 
-    -- Set up initial VM, either with chosen contract or Etheno initialization file
-    -- need to use snd to add to ABI dict
-    vm = initialVM solConf.allowFFI
-           & #block % #gaslimit .~ unlimitedGasPerBlock
-           & #block % #maxCodeSize .~ fromIntegral solConf.codeSize
+  -- Set up initial VM, either with chosen contract or Etheno initialization file
+  -- need to use snd to add to ABI dict
+  initVM <- stToIO $ initialVM solConf.allowFFI
+  let vm = initVM & #block % #gaslimit .~ unlimitedGasPerBlock
+                  & #block % #maxCodeSize .~ fromIntegral solConf.codeSize
 
   blank' <- maybe (pure vm) (loadEthenoBatch solConf.allowFFI) solConf.initialize
   let blank = populateAddresses (Set.insert solConf.deployer solConf.sender)
@@ -314,13 +317,28 @@ mkWorld
   -> Maybe ContractName
   -> SlitherInfo
   -> World
-mkWorld SolConf{sender, testMode} em m c si =
+mkWorld SolConf{sender, testMode} eventMap sigMap maybeContract slitherInfo =
   let
-    ps = filterResults c si.payableFunctions
-    as = if isAssertionMode testMode then filterResults c si.asserts else []
-    cs = if isDapptestMode testMode then [] else filterResults c si.constantFunctions \\ as
-    (hm, lm) = prepareHashMaps cs as $ filterFallbacks c si.fallbackDefined si.receiveDefined m
-  in World sender hm lm ps em
+    payableSigs = filterResults maybeContract slitherInfo.payableFunctions
+    as = if isAssertionMode testMode then filterResults maybeContract slitherInfo.asserts else []
+    cs = if isDapptestMode testMode then [] else filterResults maybeContract slitherInfo.constantFunctions \\ as
+    (highSignatureMap, lowSignatureMap) = prepareHashMaps cs as $
+      filterFallbacks maybeContract slitherInfo.fallbackDefined slitherInfo.receiveDefined sigMap
+  in World { senders = sender
+           , highSignatureMap
+           , lowSignatureMap
+           , payableSigs
+           , eventMap
+           }
+
+-- | This function is used to filter the lists of function names according to the supplied
+-- contract name (if any) and returns a list of hashes
+filterResults :: Maybe ContractName -> Map ContractName [FunctionName] -> [FunctionSelector]
+filterResults (Just contractName) rs =
+  case Map.lookup contractName rs of
+    Nothing -> filterResults Nothing rs
+    Just sig -> hashSig <$> sig
+filterResults Nothing rs = hashSig <$> (concat . Map.elems) rs
 
 filterFallbacks
   :: Maybe ContractName
@@ -361,17 +379,16 @@ prepareHashMaps cs as m =
 -- contract names passed here don't need the file they occur in specified.
 loadSolTests
   :: Env
-  -> NonEmpty FilePath
   -> Maybe Text
-  -> IO (VM, World, [EchidnaTest])
-loadSolTests env fp name = do
+  -> IO (VM RealWorld, World, [EchidnaTest])
+loadSolTests env name = do
   let solConf = env.cfg.solConf
-  (contracts, _) <- compileContracts solConf fp
+  let contracts = Map.elems env.dapp.solcByName
   (vm, funs, testNames, _signatureMap) <- loadSpecified env name contracts
   let
     eventMap = Map.unions $ map (.eventMap) contracts
     world = World solConf.sender mempty Nothing [] eventMap
-    echidnaTests = createTests solConf.testMode True testNames vm.state.contract funs
+    echidnaTests = createTests solConf.testMode True testNames (forceAddr vm.state.contract) funs
   pure (vm, world, echidnaTests)
 
 mkLargeAbiInt :: Int -> AbiValue

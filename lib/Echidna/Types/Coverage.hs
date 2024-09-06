@@ -1,18 +1,21 @@
 module Echidna.Types.Coverage where
 
+import Data.Aeson (ToJSON(toJSON), FromJSON(parseJSON), withText)
 import Data.Bits (testBit)
-import Data.ByteString (ByteString)
 import Data.List (foldl')
 import Data.Map qualified as Map
 import Data.Map.Strict (Map)
+import Data.Text (toLower)
 import Data.Vector.Unboxed.Mutable (IOVector)
 import Data.Vector.Unboxed.Mutable qualified as V
 import Data.Word (Word64)
+import EVM.Types (W256)
 
 import Echidna.Types.Tx (TxResult)
 
--- | Map with the coverage information needed for fuzzing and source code printing
-type CoverageMap = Map ByteString (IOVector CoverageInfo)
+-- | Map with the coverage information needed for fuzzing and source code printing.
+-- Indexed by contracts' compile-time codehash; see `CodehashMap`.
+type CoverageMap = Map W256 (IOVector CoverageInfo)
 
 -- | Basic coverage information
 type CoverageInfo = (OpIx, StackDepths, TxResults)
@@ -43,3 +46,16 @@ unpackTxResults txResults =
       then toEnum bit : results
       else results
   ) [] [0..63]
+
+data CoverageFileType = Lcov | Html | Txt deriving (Eq, Show)
+
+instance ToJSON CoverageFileType where
+  toJSON = toJSON . show
+
+instance FromJSON CoverageFileType where
+  parseJSON = withText "CoverageFileType" $ readFn . toLower where
+    readFn "lcov" = pure Lcov
+    readFn "html" = pure Html
+    readFn "text" = pure Txt
+    readFn "txt"  = pure Txt
+    readFn _ = fail "could not parse CoverageFileType"

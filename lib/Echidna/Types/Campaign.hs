@@ -1,14 +1,16 @@
 module Echidna.Types.Campaign where
 
+import Control.Concurrent (ThreadId)
+import Data.Aeson
 import Data.Map (Map)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Word (Word8)
+import Data.Word (Word8, Word16)
 
 import Echidna.ABI (GenDict, emptyDict, encodeSig)
-import Echidna.Output.Source (CoverageFileType)
 import Echidna.Types
-import Echidna.Types.Coverage (CoverageMap)
+import Echidna.Types.Coverage (CoverageFileType, CoverageMap)
 import Echidna.Types.Test (TestType (..), EchidnaTest(..))
 import Echidna.Types.Tx (Tx)
 
@@ -39,17 +41,47 @@ data CampaignConf = CampaignConf
   , coverageFormats :: [CoverageFileType]
     -- ^ List of file formats to save coverage reports
   , workers         :: Maybe Word8
+    -- ^ Number of fuzzing workers
+  , serverPort      :: Maybe Word16
+    -- ^ Server-Sent Events HTTP port number, if missing server is not ran
+  , symExec         :: Bool
+    -- ^ Whether to add an additional symbolic execution worker
+  , symExecTimeout  :: Int
+    -- ^ Timeout for symbolic execution SMT solver.
+    -- Only relevant if symExec is True
+  , symExecNSolvers :: Int
+    -- ^ Number of SMT solvers used in symbolic execution.
+    -- Only relevant if symExec is True
   }
 
+type WorkerId = Int
+
 data CampaignEvent
+  = WorkerEvent WorkerId WorkerEvent
+  | Failure String
+
+data WorkerEvent
   = TestFalsified !EchidnaTest
   | TestOptimized !EchidnaTest
-  | NewCoverage !Int !Int !Int
-  | TxSequenceReplayed !Int !Int
+  | NewCoverage { points :: !Int, numCodehashes :: !Int, corpusSize :: !Int, transactions :: [Tx] }
+  | TxSequenceReplayed FilePath !Int !Int
+  | TxSequenceReplayFailed FilePath Tx
   | WorkerStopped WorkerStopReason
   -- ^ This is a terminal event. Worker exits and won't push any events after
   -- this one
   deriving Show
+
+instance ToJSON WorkerEvent where
+  toJSON = \case
+    TestFalsified test -> toJSON test
+    TestOptimized test -> toJSON test
+    NewCoverage { points, numCodehashes, corpusSize } ->
+      object [ "coverage" .= points, "contracts" .= numCodehashes, "corpus_size" .= corpusSize]
+    TxSequenceReplayed file current total ->
+      object [ "file" .= file, "current" .= current, "total" .= total ]
+    TxSequenceReplayFailed file tx ->
+      object [ "file" .= file, "tx" .= tx ]
+    WorkerStopped reason -> object [ "reason" .= show reason ]
 
 data WorkerStopReason
   = TestLimitReached
@@ -61,22 +93,26 @@ data WorkerStopReason
 
 ppCampaignEvent :: CampaignEvent -> String
 ppCampaignEvent = \case
+  WorkerEvent _ e -> ppWorkerEvent e
+  Failure err -> err
+
+ppWorkerEvent :: WorkerEvent -> String
+ppWorkerEvent = \case
   TestFalsified test ->
-    let name = case test.testType of
-                 PropertyTest n _ -> n
-                 AssertionTest _ n _ -> encodeSig n
-                 CallTest n _ -> n
-                 _ -> error "impossible"
-    in "Test " <> T.unpack name <> " falsified!"
+    "Test " <> T.unpack (showTest test) <> " falsified!"
   TestOptimized test ->
     let name = case test.testType of OptimizationTest n _ -> n; _ -> error "fixme"
     in "New maximum value of " <> T.unpack name <> ": " <> show test.value
-  NewCoverage points codehashes corpus ->
+  NewCoverage { points, numCodehashes, corpusSize } ->
     "New coverage: " <> show points <> " instr, "
-      <> show codehashes <> " contracts, "
-      <> show corpus <> " seqs in corpus"
-  TxSequenceReplayed current total ->
-    "Sequence replayed from corpus (" <> show current <> "/" <> show total <> ")"
+      <> show numCodehashes <> " contracts, "
+      <> show corpusSize <> " seqs in corpus"
+  TxSequenceReplayed file current total ->
+    "Sequence replayed from corpus file " <> file <> " (" <> show current <> "/" <> show total <> ")"
+  TxSequenceReplayFailed file tx ->
+    "WARNING: Sequence replay from corpus file " <> file <> " failed. " <>
+    "The destination contract is not deployed for this transaction: " <> show tx <> ". " <>
+    "Remove the file or the transaction to fix the issue."
   WorkerStopped TestLimitReached ->
     "Test limit reached. Stopping."
   WorkerStopped TimeLimitReached ->
@@ -89,6 +125,12 @@ ppCampaignEvent = \case
     "Crashed:\n\n" <>
     e <>
     "\n\nPlease report it to https://github.com/crytic/echidna/issues"
+  where
+    showTest test = case test.testType of
+      PropertyTest n _ -> n
+      AssertionTest _ n _ -> encodeSig n
+      CallTest n _ -> n
+      _ -> error "impossible"
 
 -- | The state of a fuzzing campaign.
 data WorkerState = WorkerState
@@ -104,6 +146,9 @@ data WorkerState = WorkerState
     -- ^ Number of times the callseq is called
   , ncalls      :: !Int
     -- ^ Number of calls executed while fuzzing
+  , runningThreads :: [ThreadId]
+    -- ^ Extra threads currently being run,
+    --   aside from the main worker thread
   }
 
 initialWorkerState :: WorkerState
@@ -114,6 +159,7 @@ initialWorkerState =
               , newCoverage = False
               , ncallseqs = 0
               , ncalls = 0
+              , runningThreads = []
               }
 
 defaultTestLimit :: Int
@@ -124,3 +170,12 @@ defaultSequenceLength = 100
 
 defaultShrinkLimit :: Int
 defaultShrinkLimit = 5000
+
+-- | Get number of fuzzing workers (doesn't include sym exec worker)
+-- Defaults to 1 if set to Nothing
+getNFuzzWorkers :: CampaignConf -> Int
+getNFuzzWorkers conf = fromIntegral (fromMaybe 1 (conf.workers))
+
+-- | Number of workers, including SymExec worker if there is one
+getNWorkers :: CampaignConf -> Int
+getNWorkers conf = getNFuzzWorkers conf + (if conf.symExec then 1 else 0)

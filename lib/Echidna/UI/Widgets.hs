@@ -4,18 +4,21 @@ module Echidna.UI.Widgets where
 
 #ifdef INTERACTIVE_UI
 
-import Brick
+import Brick hiding (style)
 import Brick.AttrMap qualified as A
 import Brick.Widgets.Border
 import Brick.Widgets.Center
 import Brick.Widgets.Dialog qualified as B
 import Control.Monad.Reader (MonadReader, asks, ask)
+import Control.Monad.ST (RealWorld)
 import Data.List (nub, intersperse, sortBy)
 import Data.Map (Map)
 import Data.Map qualified as Map
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (fromMaybe, isJust, fromJust)
 import Data.Sequence (Seq)
 import Data.Sequence qualified as Seq
+import Data.String.AnsiEscapeCodes.Strip.Text (stripAnsiEscapeCodes)
+import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (LocalTime, NominalDiffTime, formatTime, defaultTimeLocale, diffLocalTime)
 import Data.Version (showVersion)
@@ -25,7 +28,6 @@ import Text.Printf (printf)
 import Text.Wrap
 
 import Echidna.ABI
-import Echidna.Events (Events)
 import Echidna.Types.Campaign
 import Echidna.Types.Config
 import Echidna.Types.Test
@@ -33,8 +35,8 @@ import Echidna.Types.Tx (Tx(..), TxResult(..))
 import Echidna.UI.Report
 import Echidna.Utility (timePrefix)
 
-import EVM.Types (Addr, W256)
-import EVM (Contract)
+import EVM.Format (showTraceTree)
+import EVM.Types (Addr, Contract, W256, VM(..))
 
 data UIState = UIState
   { status :: UIStateStatus
@@ -44,10 +46,10 @@ data UIState = UIState
   , now :: LocalTime
   , fetchedContracts :: Map Addr (Maybe Contract)
   , fetchedSlots :: Map Addr (Map W256 (Maybe W256))
-  , fetchedDialog :: B.Dialog ()
+  , fetchedDialog :: B.Dialog () Name
   , displayFetchedDialog :: Bool
 
-  , workerEvents :: Seq (Int, LocalTime, CampaignEvent)
+  , events :: Seq (LocalTime, CampaignEvent)
   , workersAlive :: Int
 
   , corpusSize :: Int
@@ -105,7 +107,7 @@ campaignStatus uiState = do
   where
   mainbox inner underneath = do
     env <- ask
-    pure $ hCenter . hLimit 120 $
+    pure $ hCenter . hLimit 160 $
       joinBorders $ borderWithLabel echidnaTitle $
       summaryWidget env uiState
       <=>
@@ -115,7 +117,7 @@ campaignStatus uiState = do
       inner
       <=>
       hBorderWithLabel (withAttr (attrName "subtitle") $ str $
-        " Log (" <> show (length uiState.workerEvents) <> ") ")
+        " Log (" <> show (length uiState.events) <> ") ")
       <=>
       logPane uiState
       <=>
@@ -135,12 +137,14 @@ logPane uiState =
   withVScrollBars OnRight .
   withVScrollBarHandles .
   viewport LogViewPort Vertical $
-  foldl (<=>) emptyWidget (showLogLine <$> Seq.reverse uiState.workerEvents)
+  foldl (<=>) emptyWidget (showLogLine <$> Seq.reverse uiState.events)
 
-showLogLine :: (Int, LocalTime, CampaignEvent) -> Widget Name
-showLogLine (workerId, time, event) =
+showLogLine :: (LocalTime, CampaignEvent) -> Widget Name
+showLogLine (time, event@(WorkerEvent workerId _)) =
   (withAttr (attrName "time") $ str $ (timePrefix time) <> "[Worker " <> show workerId <> "] ")
     <+> strBreak (ppCampaignEvent event)
+showLogLine (time, event) =
+  (withAttr (attrName "time") $ str $ (timePrefix time) <> " ") <+> strBreak (ppCampaignEvent event)
 
 summaryWidget :: Env -> UIState -> Widget Name
 summaryWidget env uiState =
@@ -223,7 +227,7 @@ perfWidget uiState =
 ppSeed :: [WorkerState] -> String
 ppSeed campaigns = show (head campaigns).genDict.defSeed
 
-fetchedDialogWidget :: UIState -> Widget n
+fetchedDialogWidget :: UIState -> Widget Name
 fetchedDialogWidget uiState =
   B.renderDialog uiState.fetchedDialog $ padLeftRight 1 $
     foldl (<=>) emptyWidget (Map.mapWithKey renderContract uiState.fetchedContracts)
@@ -277,36 +281,42 @@ tsWidget
   -> EchidnaTest
   -> m (Widget Name, Widget Name)
 tsWidget (Failed e) _ = pure (str "could not evaluate", str $ show e)
-tsWidget Solved     t = failWidget Nothing t.reproducer t.events t.value t.result
+tsWidget Solved     t = failWidget Nothing t.reproducer (fromJust t.vm) t.value t.result
 tsWidget Passed     _ = pure (success $ str "PASSED!", emptyWidget)
 tsWidget Open       _ = pure (success $ str "passing", emptyWidget)
 tsWidget (Large n)  t = do
   m <- asks (.cfg.campaignConf.shrinkLimit)
-  failWidget (if n < m then Just (n,m) else Nothing) t.reproducer t.events t.value t.result
+  failWidget (if n < m then Just (n,m) else Nothing) t.reproducer (fromJust t.vm) t.value t.result
 
 titleWidget :: Widget n
 titleWidget = str "Call sequence" <+> str ":"
 
-eventWidget :: Events -> Widget n
-eventWidget es =
-  if null es then str ""
-  else str "Event sequence" <+> str ":"
-       <=> strBreak (T.unpack $ T.intercalate "\n" es)
+tracesWidget :: MonadReader Env m => VM RealWorld -> m (Widget n)
+tracesWidget vm = do
+  dappInfo <- asks (.dapp)
+  -- TODO: showTraceTree does coloring with ANSI escape codes, we need to strip
+  -- those because they break the Brick TUI. Fix in hevm so we can display
+  -- colors here as well.
+  let traces = stripAnsiEscapeCodes $ showTraceTree dappInfo vm
+  pure $
+    if T.null traces then str ""
+    else str "Traces" <+> str ":" <=> (txtBreak traces)
 
 failWidget
   :: MonadReader Env m
   => Maybe (Int, Int)
   -> [Tx]
-  -> Events
+  -> VM RealWorld
   -> TestValue
   -> TxResult
   -> m (Widget Name, Widget Name)
 failWidget _ [] _  _  _= pure (failureBadge, str "*no transactions made*")
-failWidget b xs es _ r = do
-  s <- seqWidget xs
+failWidget b xs vm _ r = do
+  s <- seqWidget vm xs
+  traces <- tracesWidget vm
   pure
     ( failureBadge <+> str (" with " ++ show r)
-    , status <=> titleWidget <=> s <=> eventWidget es
+    , status <=> titleWidget <=> s <=> str " " <=> traces
     )
   where
   status = case b of
@@ -328,21 +338,22 @@ optWidget Open       t =
     "optimizing, max value: " ++ show t.value, emptyWidget)
 optWidget (Large n)  t = do
   m <- asks (.cfg.campaignConf.shrinkLimit)
-  maxWidget (if n < m then Just (n,m) else Nothing) t.reproducer t.events t.value
+  maxWidget (if n < m then Just (n,m) else Nothing) t.reproducer (fromJust t.vm) t.value
 
 maxWidget
   :: MonadReader Env m
   => Maybe (Int, Int)
   -> [Tx]
-  -> Events
+  -> VM RealWorld
   -> TestValue
   -> m (Widget Name, Widget Name)
 maxWidget _ [] _  _ = pure (failureBadge, str "*no transactions made*")
-maxWidget b xs es v = do
-  s <- seqWidget xs
+maxWidget b xs vm v = do
+  s <- seqWidget vm xs
+  traces <- tracesWidget vm
   pure
     ( maximumBadge <+> str (" max value: " ++ show v)
-    , status <=> titleWidget <=> s <=> eventWidget es
+    , status <=> titleWidget <=> s <=> str " " <=> traces
     )
   where
   status = case b of
@@ -351,10 +362,10 @@ maxWidget b xs es v = do
       str "Current action: " <+>
         withAttr (attrName "working") (str ("shrinking " ++ progress n m))
 
-seqWidget :: MonadReader Env m => [Tx] -> m (Widget Name)
-seqWidget xs = do
-  ppTxs <- mapM (ppTx $ length (nub $ (.src) <$> xs) /= 1) xs
-  let ordinals = str . printf "%d." <$> [1 :: Int ..]
+seqWidget :: MonadReader Env m => VM RealWorld -> [Tx] -> m (Widget Name)
+seqWidget vm xs = do
+  ppTxs <- mapM (ppTx vm $ length (nub $ (.src) <$> xs) /= 1) xs
+  let ordinals = str . printf "%d. " <$> [1 :: Int ..]
   pure $
     foldl (<=>) emptyWidget $
       zipWith (<+>) ordinals (withAttr (attrName "tx") . strBreak <$> ppTxs)
@@ -367,5 +378,8 @@ maximumBadge = withAttr (attrName "maximum") $ str "OPTIMIZED!"
 
 strBreak :: String -> Widget n
 strBreak = strWrapWith $ defaultWrapSettings { breakLongWords = True }
+
+txtBreak :: Text -> Widget n
+txtBreak = txtWrapWith $ defaultWrapSettings { breakLongWords = True }
 
 #endif

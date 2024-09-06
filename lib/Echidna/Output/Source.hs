@@ -1,16 +1,19 @@
+{-# LANGUAGE ViewPatterns #-}
+
 module Echidna.Output.Source where
 
 import Prelude hiding (writeFile)
 
-import Data.Aeson (ToJSON(..), FromJSON(..), withText)
+import Data.ByteString qualified as BS
 import Data.Foldable
+import Data.IORef (readIORef)
 import Data.List (nub, sort)
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Map (Map)
 import Data.Map qualified as Map
 import Data.Sequence qualified as Seq
 import Data.Set qualified as S
-import Data.Text (Text, pack, toLower)
+import Data.Text (Text, pack)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8)
 import Data.Text.IO (writeFile)
@@ -21,25 +24,25 @@ import System.Directory (createDirectoryIfMissing)
 import System.FilePath ((</>))
 import Text.Printf (printf)
 
-import EVM.Debug (srcMapCodePos)
+import EVM.Dapp (srcMapCodePos)
 import EVM.Solidity (SourceCache(..), SrcMap, SolcContract(..))
 
-import Echidna.Types.Coverage (OpIx, unpackTxResults, CoverageMap)
+import Echidna.Types.Campaign (CampaignConf(..))
+import Echidna.Types.Config (Env(..), EConfig(..))
+import Echidna.Types.Coverage (OpIx, unpackTxResults, CoverageMap, CoverageFileType (..))
 import Echidna.Types.Tx (TxResult(..))
-import Echidna.Types.Signature (getBytecodeMetadata)
-
-type FilePathText = Text
 
 saveCoverages
-  :: [CoverageFileType]
+  :: Env
   -> Int
   -> FilePath
   -> SourceCache
   -> [SolcContract]
-  -> CoverageMap
   -> IO ()
-saveCoverages fileTypes seed d sc cs s =
-  mapM_ (\ty -> saveCoverage ty seed d sc cs s) fileTypes
+saveCoverages env seed d sc cs = do
+  let fileTypes = env.cfg.campaignConf.coverageFormats
+  coverage <- readIORef env.coverageRef
+  mapM_ (\ty -> saveCoverage ty seed d sc cs coverage) fileTypes
 
 saveCoverage
   :: CoverageFileType
@@ -56,19 +59,6 @@ saveCoverage fileType seed d sc cs covMap = do
   createDirectoryIfMissing True d
   writeFile fn cc
 
-data CoverageFileType = Lcov | Html | Txt deriving (Eq, Show)
-
-instance ToJSON CoverageFileType where
-  toJSON = toJSON . show
-
-instance FromJSON CoverageFileType where
-  parseJSON = withText "CoverageFileType" $ readFn . toLower where
-    readFn "lcov" = pure Lcov
-    readFn "html" = pure Html
-    readFn "text" = pure Txt
-    readFn "txt"  = pure Txt
-    readFn _ = fail "could not parse CoverageFileType"
-
 coverageFileExtension :: CoverageFileType -> String
 coverageFileExtension Lcov = ".lcov"
 coverageFileExtension Html = ".html"
@@ -78,20 +68,18 @@ coverageFileExtension Txt = ".txt"
 ppCoveredCode :: CoverageFileType -> SourceCache -> [SolcContract] -> CoverageMap -> IO Text
 ppCoveredCode fileType sc cs s | null s = pure "Coverage map is empty"
   | otherwise = do
-  let allFiles = zipWith (\(srcPath, _rawSource) srcLines -> (srcPath, V.map decodeUtf8 srcLines))
-                   sc.files
-                   sc.lines
-      -- ^ Collect all the possible lines from all the files
+  -- List of covered lines during the fuzzing campaing
   covLines <- srcMapCov sc s cs
-      -- ^ List of covered lines during the fuzzing campaing
   let
+    -- Collect all the possible lines from all the files
+    allFiles = (\(path, src) -> (path, V.fromList (decodeUtf8 <$> BS.split 0xa src))) <$> Map.elems sc.files
+    -- Excludes lines such as comments or blanks
     runtimeLinesMap = buildRuntimeLinesMap sc cs
-    -- ^ Excludes lines such as comments or blanks
+    -- Pretty print individual file coverage
     ppFile (srcPath, srcLines) =
       let runtimeLines = fromMaybe mempty $ Map.lookup srcPath runtimeLinesMap
           marked = markLines fileType srcLines runtimeLines (fromMaybe Map.empty (Map.lookup srcPath covLines))
       in T.unlines (changeFileName srcPath : changeFileLines (V.toList marked))
-    -- ^ Pretty print individual file coverage
     topHeader = case fileType of
       Lcov -> "TN:\n"
       Html -> "<style> code { white-space: pre-wrap; display: block; background-color: #eee; }" <>
@@ -102,7 +90,7 @@ ppCoveredCode fileType sc cs s | null s = pure "Coverage map is empty"
               "</style>"
       Txt  -> ""
     -- ^ Text to add to top of the file
-    changeFileName fn = case fileType of
+    changeFileName (T.pack -> fn) = case fileType of
       Lcov -> "SF:" <> fn
       Html -> "<b>" <> HTML.text fn <> "</b>"
       Txt  -> fn
@@ -158,13 +146,13 @@ getMarker ErrorOutOfGas = 'o'
 getMarker _             = 'e'
 
 -- | Given a source cache, a coverage map, a contract returns a list of covered lines
-srcMapCov :: SourceCache -> CoverageMap -> [SolcContract] -> IO (Map FilePathText (Map Int [TxResult]))
+srcMapCov :: SourceCache -> CoverageMap -> [SolcContract] -> IO (Map FilePath (Map Int [TxResult]))
 srcMapCov sc covMap contracts = do
   Map.unionsWith Map.union <$> mapM linesCovered contracts
   where
-  linesCovered :: SolcContract -> IO (Map Text (Map Int [TxResult]))
+  linesCovered :: SolcContract -> IO (Map FilePath (Map Int [TxResult]))
   linesCovered c =
-    case Map.lookup (getBytecodeMetadata c.runtimeCode) covMap of
+    case Map.lookup c.runtimeCodehash covMap of
       Just vec -> VU.foldl' (\acc covInfo -> case covInfo of
         (-1, _, _) -> acc -- not covered
         (opIx, _stackDepths, txResults) ->
@@ -193,7 +181,7 @@ srcMapForOpLocation contract opIx =
 
 -- | Builds a Map from file paths to lines that can be executed, this excludes
 -- for example lines with comments
-buildRuntimeLinesMap :: SourceCache -> [SolcContract] -> Map Text (S.Set Int)
+buildRuntimeLinesMap :: SourceCache -> [SolcContract] -> Map FilePath (S.Set Int)
 buildRuntimeLinesMap sc contracts =
   Map.fromListWith (<>)
     [(k, S.singleton v) | (k, v) <- mapMaybe (srcMapCodePos sc) srcMaps]

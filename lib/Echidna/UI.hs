@@ -18,31 +18,33 @@ import Control.Concurrent (killThread, threadDelay)
 import Control.Exception (AsyncException)
 import Control.Monad
 import Control.Monad.Catch
-import Control.Monad.Random.Strict (MonadRandom)
 import Control.Monad.Reader
 import Control.Monad.State.Strict hiding (state)
+import Control.Monad.ST (RealWorld)
 import Data.ByteString.Lazy qualified as BS
 import Data.List.Split (chunksOf)
 import Data.Map (Map)
 import Data.Maybe (fromMaybe, isJust)
+import Data.Text (Text)
 import Data.Time
 import UnliftIO
-  ( MonadUnliftIO, newIORef, readIORef, atomicWriteIORef, hFlush, stdout
-  , writeIORef, atomicModifyIORef', timeout
-  )
+  ( MonadUnliftIO, IORef, newIORef, readIORef, hFlush, stdout , writeIORef, timeout)
 import UnliftIO.Concurrent hiding (killThread, threadDelay)
 
-import EVM (VM, Contract)
-import EVM.Types (Addr, W256)
+import EVM.Solidity (SolcContract)
+import EVM.Types (Addr, Contract, VM, W256)
 
 import Echidna.ABI
-import Echidna.Campaign (runWorker)
+import Echidna.Campaign (runWorker, spawnListener)
+import Echidna.Output.Corpus (saveCorpusEvent)
 import Echidna.Output.JSON qualified
+import Echidna.Server (runSSEServer)
 import Echidna.Types.Campaign
 import Echidna.Types.Config
-import Echidna.Types.Corpus (corpusSize)
+import Echidna.Types.Corpus qualified as Corpus
 import Echidna.Types.Coverage (scoveragePoints)
-import Echidna.Types.Test (EchidnaTest(..), didFail, isOptimizationTest, TestType, TestState(..))
+import Echidna.Types.Solidity (SolConf(..))
+import Echidna.Types.Test (EchidnaTest(..), didFail, isOptimizationTest)
 import Echidna.Types.Tx (Tx)
 import Echidna.Types.World (World)
 import Echidna.UI.Report
@@ -52,25 +54,27 @@ data UIEvent =
   CampaignUpdated LocalTime [EchidnaTest] [WorkerState]
   | FetchCacheUpdated (Map Addr (Maybe Contract))
                       (Map Addr (Map W256 (Maybe W256)))
-  | WorkerEvent (Int, LocalTime, CampaignEvent)
+  | EventReceived (LocalTime, CampaignEvent)
 
 -- | Set up and run an Echidna 'Campaign' and display interactive UI or
 -- print non-interactive output in desired format at the end
 ui
-  :: (MonadCatch m, MonadRandom m, MonadReader Env m, MonadUnliftIO m)
-  => VM      -- ^ Initial VM state
+  :: (MonadCatch m, MonadReader Env m, MonadUnliftIO m)
+  => VM RealWorld -- ^ Initial VM state
   -> World   -- ^ Initial world state
   -> GenDict
-  -> [[Tx]]
+  -> [(FilePath, [Tx])]
+  -> Maybe Text
+  -> [SolcContract]
   -> m [WorkerState]
-ui vm world dict initialCorpus = do
+ui vm world dict initialCorpus name cs = do
   env <- ask
   conf <- asks (.cfg)
   terminalPresent <- liftIO isTerminal
 
   let
-    -- default to one worker if not configured
-    nworkers = fromIntegral $ fromMaybe 1 conf.campaignConf.workers
+    nFuzzWorkers = getNFuzzWorkers conf.campaignConf
+    nworkers = getNWorkers conf.campaignConf
 
     effectiveMode = case conf.uiConf.operationMode of
       Interactive | not terminalPresent -> NonInteractive Text
@@ -79,25 +83,24 @@ ui vm world dict initialCorpus = do
     -- Distribute over all workers, could be slightly bigger overall due to
     -- ceiling but this doesn't matter
     perWorkerTestLimit = ceiling
-      (fromIntegral conf.campaignConf.testLimit / fromIntegral nworkers :: Double)
+      (fromIntegral conf.campaignConf.testLimit / fromIntegral nFuzzWorkers :: Double)
 
     chunkSize = ceiling
-      (fromIntegral (length initialCorpus) / fromIntegral nworkers :: Double)
+      (fromIntegral (length initialCorpus) / fromIntegral nFuzzWorkers :: Double)
     corpusChunks = chunksOf chunkSize initialCorpus ++ repeat []
+
+  corpusSaverStopVar <- spawnListener (saveCorpusEvent env)
 
   workers <- forM (zip corpusChunks [0..(nworkers-1)]) $
     uncurry (spawnWorker env perWorkerTestLimit)
-
-  -- A var used to block and wait for listener to finish
-  listenerStopVar <- newEmptyMVar
 
   case effectiveMode of
 #ifdef INTERACTIVE_UI
     Interactive -> do
       -- Channel to push events to update UI
       uiChannel <- liftIO $ newBChan 1000
-      let forwardEvent = writeBChan uiChannel . WorkerEvent
-      liftIO $ spawnListener env forwardEvent nworkers listenerStopVar
+      let forwardEvent = writeBChan uiChannel . EventReceived
+      uiEventsForwarderStopVar <- spawnListener forwardEvent
 
       ticker <- liftIO . forkIO . forever $ do
         threadDelay 200_000 -- 200 ms
@@ -132,9 +135,9 @@ ui vm world dict initialCorpus = do
           , now = now
           , fetchedContracts = mempty
           , fetchedSlots = mempty
-          , fetchedDialog = B.dialog (Just " Fetched contracts/slots ") Nothing 80
+          , fetchedDialog = B.dialog (Just $ str " Fetched contracts/slots ") Nothing 80
           , displayFetchedDialog = False
-          , workerEvents = mempty
+          , events = mempty
           , corpusSize = 0
           , coverage = 0
           , numCodehashes = 0
@@ -146,12 +149,12 @@ ui vm world dict initialCorpus = do
       stopWorkers workers
 
       -- wait for all events to be processed
-      takeMVar listenerStopVar
+      forM_ [uiEventsForwarderStopVar, corpusSaverStopVar] takeMVar
 
       liftIO $ killThread ticker
 
       states <- workerStates workers
-      liftIO . putStrLn =<< ppCampaign states
+      liftIO . putStrLn =<< ppCampaign vm states
 
       pure states
 #else
@@ -159,13 +162,17 @@ ui vm world dict initialCorpus = do
 #endif
 
     NonInteractive outputFormat -> do
+      serverStopVar <- newEmptyMVar
 #ifdef INTERACTIVE_UI
       -- Handles ctrl-c, TODO: this doesn't work on Windows
       liftIO $ forM_ [sigINT, sigTERM] $ \sig ->
-        installHandler sig (Catch $ stopWorkers workers) Nothing
+        let handler = Catch $ do
+              stopWorkers workers
+              void $ tryPutMVar serverStopVar ()
+        in installHandler sig handler Nothing
 #endif
       let forwardEvent = putStrLn . ppLogLine
-      liftIO $ spawnListener env forwardEvent nworkers listenerStopVar
+      uiEventsForwarderStopVar <- spawnListener forwardEvent
 
       let printStatus = do
             states <- liftIO $ workerStates workers
@@ -174,17 +181,26 @@ ui vm world dict initialCorpus = do
             putStrLn $ time <> "[status] " <> line
             hFlush stdout
 
+      case conf.campaignConf.serverPort of
+        Just port -> liftIO $ runSSEServer serverStopVar env port nworkers
+        Nothing -> pure ()
+
       ticker <- liftIO . forkIO . forever $ do
         threadDelay 3_000_000 -- 3 seconds
         printStatus
 
       -- wait for all events to be processed
-      takeMVar listenerStopVar
+      forM_ [uiEventsForwarderStopVar, corpusSaverStopVar] takeMVar
 
       liftIO $ killThread ticker
 
       -- print final status regardless the last scheduled update
       liftIO printStatus
+
+      when (isJust conf.campaignConf.serverPort) $ do
+        -- wait until we send all SSE events
+        liftIO $ putStrLn "Waiting until all SSE are received..."
+        readMVar serverStopVar
 
       states <- liftIO $ workerStates workers
 
@@ -192,7 +208,7 @@ ui vm world dict initialCorpus = do
         JSON ->
           liftIO $ BS.putStr =<< Echidna.Output.JSON.encodeCampaign env states
         Text -> do
-          liftIO . putStrLn =<< ppCampaign states
+          liftIO . putStrLn =<< ppCampaign vm states
         None ->
           pure ()
       pure states
@@ -205,10 +221,13 @@ ui vm world dict initialCorpus = do
     threadId <- forkIO $ do
       -- TODO: maybe figure this out with forkFinally?
       stopReason <- catches (do
-          let timeoutUsecs = maybe (-1) (*1_000_000) env.cfg.uiConf.maxTime
+          let
+            timeoutUsecs = maybe (-1) (*1_000_000) env.cfg.uiConf.maxTime
+            isSym = env.cfg.campaignConf.symExec && workerId == (getNWorkers env.cfg.campaignConf)-1
+            corpus = if isSym then initialCorpus else corpusChunk
           maybeResult <- timeout timeoutUsecs $
-            runWorker (get >>= writeIORef stateRef)
-                      vm world dict workerId corpusChunk testLimit
+            runWorker isSym (get >>= writeIORef stateRef)
+                      vm world dict workerId corpus testLimit name cs
           pure $ case maybeResult of
             Just (stopReason, _finalState) -> stopReason
             Nothing -> TimeLimitReached
@@ -218,7 +237,7 @@ ui vm world dict initialCorpus = do
         ]
 
       time <- liftIO getTimestamp
-      writeChan env.eventQueue (workerId, time, WorkerStopped stopReason)
+      writeChan env.eventQueue (time, WorkerEvent workerId (WorkerStopped stopReason))
 
     pure (threadId, stateRef)
 
@@ -226,33 +245,13 @@ ui vm world dict initialCorpus = do
   workerStates workers =
     forM workers $ \(_, stateRef) -> readIORef stateRef
 
--- | Listener reads events and forwards all of them to the UI using the
--- 'forwardEvent' function. It exits after receiving all 'WorkerStopped'
--- events and sets the passed 'MVar' so the parent thread can block on listener
--- until all workers are done.
-spawnListener
-  :: Env
-  -> ((Int, LocalTime, CampaignEvent) -> IO ())
-  -- ^ a function that forwards event to the UI
-  -> Int     -- ^ number of workers
-  -> MVar () -- ^ use to join this thread
-  -> IO ()
-spawnListener env forwardEvent nworkers stopVar =
-  void $ forkFinally (loop nworkers) (const $ putMVar stopVar ())
-  where
-  loop !workersAlive =
-    when (workersAlive > 0) $ do
-      event <- readChan env.eventQueue
-      forwardEvent event
-      case event of
-        (_, _, WorkerStopped _) -> loop (workersAlive - 1)
-        _                       -> loop workersAlive
-
 #ifdef INTERACTIVE_UI
  -- | Order the workers to stop immediately
-stopWorkers :: MonadIO m => [(ThreadId, a)] -> m ()
+stopWorkers :: MonadIO m => [(ThreadId, IORef WorkerState)] -> m ()
 stopWorkers workers =
-  forM_ workers $ \(threadId, _) -> liftIO $ killThread threadId
+  forM_ workers $ \(threadId, workerStateRef) -> do
+    workerState <- readIORef workerStateRef
+    liftIO $ mapM_ killThread (threadId : workerState.runningThreads)
 
 vtyConfig :: IO Config
 vtyConfig = do
@@ -279,18 +278,18 @@ monitor = do
         modify' $ \state ->
           state { fetchedContracts = contracts
                 , fetchedSlots = slots }
-      AppEvent (WorkerEvent event@(_,time,campaignEvent)) -> do
-        modify' $ \state -> state { workerEvents = state.workerEvents |> event }
+      AppEvent (EventReceived event@(time,campaignEvent)) -> do
+        modify' $ \state -> state { events = state.events |> event }
 
         case campaignEvent of
-          NewCoverage coverage numCodehashes size ->
+          WorkerEvent _ (NewCoverage { points, numCodehashes, corpusSize }) ->
             modify' $ \state ->
-              state { coverage = max state.coverage coverage -- max not really needed
-                    , corpusSize = size
+              state { coverage = max state.coverage points -- max not really needed
+                    , corpusSize
                     , numCodehashes
                     , lastNewCov = time
                     }
-          WorkerStopped _ ->
+          WorkerEvent _ (WorkerStopped _) ->
             modify' $ \state ->
               state { workersAlive = state.workersAlive - 1
                     , timeStopped = if state.workersAlive == 1
@@ -356,4 +355,5 @@ statusLine env states = do
     <> ", fuzzing: " <> show totalCalls <> "/" <> show env.cfg.campaignConf.testLimit
     <> ", values: " <> show ((.value) <$> filter isOptimizationTest tests)
     <> ", cov: " <> show points
-    <> ", corpus: " <> show (corpusSize corpus)
+    <> ", corpus: " <> show (Corpus.corpusSize corpus)
+
