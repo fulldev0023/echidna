@@ -6,12 +6,12 @@ import Test.Tasty.HUnit (testCase, assertBool)
 import Common (runContract, overrideQuiet)
 import Data.Function ((&))
 import Data.IORef (readIORef)
-import Echidna.Output.Source (CoverageFileType(..))
+import Echidna.Config (defaultConfig)
+import Echidna.Mutator.Corpus (defaultMutationConsts)
 import Echidna.Types.Campaign
 import Echidna.Types.Config (Env(..), EConfig(..))
+import Echidna.Types.Coverage (CoverageFileType(..))
 import Echidna.Types.Test
-import Echidna.Mutator.Corpus (defaultMutationConsts)
-import Echidna.Config (defaultConfig)
 
 seedTests :: TestTree
 seedTests =
@@ -34,10 +34,11 @@ seedTests =
         , mutConsts = defaultMutationConsts
         , coverageFormats = [Txt,Html,Lcov]
         , workers = Nothing
+        , serverPort = Nothing
         }
       }
       & overrideQuiet
     gen s = do
-      (env, _) <- runContract "basic/flags.sol" Nothing (cfg s)
+      (env, _) <- runContract "basic/flags.sol" Nothing (cfg s) False
       readIORef env.testsRef
     same s t = (\x y -> ((.reproducer) <$> x) == ((.reproducer) <$> y)) <$> gen s <*> gen t

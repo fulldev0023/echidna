@@ -49,7 +49,7 @@ data UIState = UIState
   , fetchedDialog :: B.Dialog () Name
   , displayFetchedDialog :: Bool
 
-  , workerEvents :: Seq (Int, LocalTime, CampaignEvent)
+  , events :: Seq (LocalTime, CampaignEvent)
   , workersAlive :: Int
 
   , corpusSize :: Int
@@ -107,7 +107,7 @@ campaignStatus uiState = do
   where
   mainbox inner underneath = do
     env <- ask
-    pure $ hCenter . hLimit 120 $
+    pure $ hCenter . hLimit 160 $
       joinBorders $ borderWithLabel echidnaTitle $
       summaryWidget env uiState
       <=>
@@ -117,7 +117,7 @@ campaignStatus uiState = do
       inner
       <=>
       hBorderWithLabel (withAttr (attrName "subtitle") $ str $
-        " Log (" <> show (length uiState.workerEvents) <> ") ")
+        " Log (" <> show (length uiState.events) <> ") ")
       <=>
       logPane uiState
       <=>
@@ -137,12 +137,14 @@ logPane uiState =
   withVScrollBars OnRight .
   withVScrollBarHandles .
   viewport LogViewPort Vertical $
-  foldl (<=>) emptyWidget (showLogLine <$> Seq.reverse uiState.workerEvents)
+  foldl (<=>) emptyWidget (showLogLine <$> Seq.reverse uiState.events)
 
-showLogLine :: (Int, LocalTime, CampaignEvent) -> Widget Name
-showLogLine (workerId, time, event) =
+showLogLine :: (LocalTime, CampaignEvent) -> Widget Name
+showLogLine (time, event@(WorkerEvent workerId _)) =
   (withAttr (attrName "time") $ str $ (timePrefix time) <> "[Worker " <> show workerId <> "] ")
     <+> strBreak (ppCampaignEvent event)
+showLogLine (time, event) =
+  (withAttr (attrName "time") $ str $ (timePrefix time) <> " ") <+> strBreak (ppCampaignEvent event)
 
 summaryWidget :: Env -> UIState -> Widget Name
 summaryWidget env uiState =
@@ -310,7 +312,7 @@ failWidget
   -> m (Widget Name, Widget Name)
 failWidget _ [] _  _  _= pure (failureBadge, str "*no transactions made*")
 failWidget b xs vm _ r = do
-  s <- seqWidget xs
+  s <- seqWidget vm xs
   traces <- tracesWidget vm
   pure
     ( failureBadge <+> str (" with " ++ show r)
@@ -347,7 +349,7 @@ maxWidget
   -> m (Widget Name, Widget Name)
 maxWidget _ [] _  _ = pure (failureBadge, str "*no transactions made*")
 maxWidget b xs vm v = do
-  s <- seqWidget xs
+  s <- seqWidget vm xs
   traces <- tracesWidget vm
   pure
     ( maximumBadge <+> str (" max value: " ++ show v)
@@ -360,10 +362,10 @@ maxWidget b xs vm v = do
       str "Current action: " <+>
         withAttr (attrName "working") (str ("shrinking " ++ progress n m))
 
-seqWidget :: MonadReader Env m => [Tx] -> m (Widget Name)
-seqWidget xs = do
-  ppTxs <- mapM (ppTx $ length (nub $ (.src) <$> xs) /= 1) xs
-  let ordinals = str . printf "%d." <$> [1 :: Int ..]
+seqWidget :: MonadReader Env m => VM RealWorld -> [Tx] -> m (Widget Name)
+seqWidget vm xs = do
+  ppTxs <- mapM (ppTx vm $ length (nub $ (.src) <$> xs) /= 1) xs
+  let ordinals = str . printf "%d. " <$> [1 :: Int ..]
   pure $
     foldl (<=>) emptyWidget $
       zipWith (<+>) ordinals (withAttr (attrName "tx") . strBreak <$> ppTxs)

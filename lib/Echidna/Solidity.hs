@@ -2,6 +2,8 @@ module Echidna.Solidity where
 
 import Optics.Core hiding (filtered)
 
+import Control.Concurrent (ThreadId)
+import Control.Concurrent.MVar (MVar)
 import Control.Monad (when, unless, forM_)
 import Control.Monad.Catch (MonadThrow(..))
 import Control.Monad.Extra (whenM)
@@ -29,6 +31,7 @@ import System.Process
 
 import EVM (initialContract, currentContract)
 import EVM.ABI
+import EVM.Dapp (DappInfo(..))
 import EVM.Solidity
 import EVM.Types hiding (Env)
 
@@ -41,35 +44,18 @@ import Echidna.Events (EventMap, extractEvents)
 import Echidna.Exec (execTx, initialVM)
 import Echidna.SourceAnalysis.Slither
 import Echidna.Symbolic (forceAddr)
+import Echidna.SymExec qualified
 import Echidna.Test (createTests, isAssertionMode, isPropertyMode, isDapptestMode)
 import Echidna.Types.Config (EConfig(..), Env(..))
 import Echidna.Types.Signature
-  (ContractName, SolSignature, SignatureMap, getBytecodeMetadata, FunctionName)
+  (ContractName, SolSignature, SignatureMap, FunctionName)
 import Echidna.Types.Solidity
 import Echidna.Types.Test (EchidnaTest(..))
 import Echidna.Types.Tx
   ( basicTx, createTxWithValue, unlimitedGasPerBlock, initialTimestamp
-  , initialBlockNumber )
+  , initialBlockNumber, Tx )
 import Echidna.Types.World (World(..))
 import Echidna.Utility (measureIO)
-
--- | Given a list of build outputs and an optional contract name, select one
--- that includes that contract (if possible). Otherwise, use the first build
--- output available (or fail if it is empty)
-selectBuildOutput :: Maybe ContractName -> [BuildOutput] -> BuildOutput
-selectBuildOutput (Just c) buildOutputs =
-  let
-    r = concatMap (\buildOutput@(BuildOutput (Contracts contracts) _) ->
-          [buildOutput | isJust $ find (Data.Text.isSuffixOf (":" <> c)) (Map.keys contracts)]
-        ) buildOutputs
-  in case r of
-    (buildOutput:_) -> buildOutput
-    _ -> error "Build output selection returned no result"
-
-selectBuildOutput _ scs =
-  case scs of
-    sc:_ -> sc
-    _    -> error "Empty source cache"
 
 readSolcBatch :: FilePath -> IO [BuildOutput]
 readSolcBatch d = do
@@ -131,13 +117,13 @@ buildWithCryticCompile solConf targetPaths = do
     usual = ["--solc-disable-warnings", "--export-format", "solc"]
     solargs = solConf.solcArgs ++ linkLibraries solConf.solcLibs & (usual ++) .
               (\sa -> if null sa then [] else ["--solc-args", sa])
-    compileOne :: FilePath -> IO [BuildOutput]
+    compileOne :: FilePath -> IO BuildOutput
     compileOne x = do
       (ec, out, err) <- measureIO solConf.quiet ("Compiling " <> x) $ do
         readCreateProcessWithExitCode
           (proc cryticCompile $ (solConf.cryticArgs ++ solargs) |> x) ""
       case ec of
-        ExitSuccess -> readSolcBatch "crytic-export"
+        ExitSuccess -> mconcat <$> readSolcBatch "crytic-export"
         ExitFailure _ -> throwM $ CompileFailure out err
 
   -- clean up previous artifacts
@@ -211,6 +197,24 @@ abiOf pref solcContract =
     filter (not . isPrefixOf pref . fst)
            (Map.elems solcContract.abiMap <&> \method -> (method.name, snd <$> method.inputs))
 
+createSymTx :: Env -> Maybe Text -> [SolcContract] -> VM RealWorld -> IO (ThreadId, MVar [Tx])
+createSymTx env name cs vm = do
+    mainContract <- choose cs name
+    Echidna.SymExec.exploreContract env.cfg mainContract vm
+  where
+    -- copied from loadSpecified
+    choose [] _ = throwM NoContracts
+    choose (c:_) Nothing = pure c
+    choose _ (Just n) =
+      maybe (throwM $ ContractNotFound n) pure $
+        find (Data.Text.isSuffixOf (contractId n) . (.contractName)) cs
+    contractId n
+      | T.any (== ':') n =
+        let (splitPath, splitName) = T.breakOn ":" n
+        in rewritePathSeparators splitPath `T.append` splitName
+      | otherwise = ":" `append` n
+    rewritePathSeparators = T.pack . joinPath . splitDirectories . T.unpack
+
 -- | Given an optional contract name and a list of 'SolcContract's, try to load the specified
 -- contract, or, if not provided, the first contract in the list, into a 'VM' usable for Echidna
 -- testing and extract an ABI and list of tests. Throws exceptions if anything returned doesn't look
@@ -250,11 +254,11 @@ loadSpecified env name cs = do
             let filtered = filterMethods contract.contractName
                                          solConf.methodFilter
                                          (abiOf solConf.prefix contract)
-            in (getBytecodeMetadata contract.runtimeCode,) <$> NE.nonEmpty filtered)
+            in (contract.runtimeCodehash,) <$> NE.nonEmpty filtered)
           cs
       else
         case NE.nonEmpty fabiOfc of
-          Just ne -> Map.singleton (getBytecodeMetadata mainContract.runtimeCode) ne
+          Just ne -> Map.singleton mainContract.runtimeCodehash ne
           Nothing -> mempty
 
   -- Set up initial VM, either with chosen contract or Etheno initialization file
@@ -410,13 +414,11 @@ prepareHashMaps cs as m =
 -- contract names passed here don't need the file they occur in specified.
 loadSolTests
   :: Env
-  -> NonEmpty FilePath
   -> Maybe Text
   -> IO (VM RealWorld, World, [EchidnaTest])
-loadSolTests env fp name = do
+loadSolTests env name = do
   let solConf = env.cfg.solConf
-  buildOutputs <- compileContracts solConf fp
-  let contracts = Map.elems . Map.unions $ (\(BuildOutput (Contracts c) _) -> c) <$> buildOutputs
+  let contracts = Map.elems env.dapp.solcByName
   (vm, funs, testNames, _signatureMap) <- loadSpecified env name contracts
   let
     eventMap = Map.unions $ map (.eventMap) contracts

@@ -3,9 +3,7 @@
 
 module Echidna.Campaign where
 
-import Optics.Core hiding ((|>))
-
-import Control.Concurrent (writeChan)
+import Control.Concurrent
 import Control.DeepSeq (force)
 import Control.Monad (replicateM, when, void, forM_)
 import Control.Monad.Catch (MonadThrow(..))
@@ -17,24 +15,29 @@ import Control.Monad.ST (RealWorld)
 import Control.Monad.Trans (lift)
 import Data.Binary.Get (runGetOrFail)
 import Data.ByteString.Lazy qualified as LBS
-import Data.IORef (readIORef, writeIORef, atomicModifyIORef')
+import Data.IORef (newIORef, readIORef, atomicModifyIORef')
+import Data.Foldable (foldlM)
+import Data.List qualified as List
 import Data.Map qualified as Map
 import Data.Map (Map, (\\))
-import Data.Maybe (isJust, mapMaybe, fromMaybe, fromJust)
+import Data.Maybe (isJust, mapMaybe, fromMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
+import Data.Time (LocalTime)
 import System.Random (mkStdGen)
 
-import EVM (bytecode, cheatCode)
+import EVM (cheatCode)
 import EVM.ABI (getAbi, AbiType(AbiAddressType), AbiValue(AbiAddress))
+import EVM.Solidity (SolcContract)
 import EVM.Types hiding (Env, Frame(state))
 
 import Echidna.ABI
 import Echidna.Exec
 import Echidna.Mutator.Corpus
 import Echidna.Shrink (shrinkTest)
-import Echidna.Symbolic (forceBuf, forceAddr)
+import Echidna.Solidity (createSymTx)
+import Echidna.Symbolic (forceAddr)
 import Echidna.Test
 import Echidna.Transaction
 import Echidna.Types (Gas)
@@ -42,7 +45,7 @@ import Echidna.Types.Campaign
 import Echidna.Types.Corpus (Corpus, corpusSize)
 import Echidna.Types.Coverage (scoveragePoints)
 import Echidna.Types.Config
-import Echidna.Types.Signature (makeBytecodeCache, FunctionName)
+import Echidna.Types.Signature (FunctionName)
 import Echidna.Types.Test
 import Echidna.Types.Test qualified as Test
 import Echidna.Types.Tx (TxCall(..), Tx(..), call)
@@ -64,34 +67,148 @@ isSuccessful =
 replayCorpus
   :: (MonadIO m, MonadThrow m, MonadRandom m, MonadReader Env m, MonadState WorkerState m)
   => VM RealWorld -- ^ VM to start replaying from
-  -> [[Tx]] -- ^ corpus to replay
+  -> [(FilePath, [Tx])] -- ^ corpus to replay
   -> m ()
 replayCorpus vm txSeqs =
-  forM_ (zip [1..] txSeqs) $ \(i, txSeq) -> do
-    _ <- callseq vm txSeq
-    pushEvent (TxSequenceReplayed i (length txSeqs))
+  forM_ (zip [1..] txSeqs) $ \(i, (file, txSeq)) -> do
+    let maybeFaultyTx =
+          List.find (\tx -> LitAddr tx.dst `notElem` Map.keys vm.env.contracts) $
+            List.filter (\case Tx { call = NoCall } -> False; _ -> True) txSeq
+    case maybeFaultyTx of
+      Nothing -> do
+        _ <- callseq vm txSeq
+        pushWorkerEvent (TxSequenceReplayed file i (length txSeqs))
+      Just faultyTx ->
+        pushWorkerEvent (TxSequenceReplayFailed file faultyTx)
+
+runWorker
+  :: (MonadIO m, MonadThrow m, MonadReader Env m)
+  => Bool -- Sym?
+  -> StateT WorkerState m ()
+  -- ^ Callback to run after each state update (for instrumentation)
+  -> VM RealWorld -- ^ Initial VM state
+  -> World   -- ^ Initial world state
+  -> GenDict -- ^ Generation dictionary
+  -> Int     -- ^ Worker id starting from 0
+  -> [(FilePath, [Tx])]
+  -- ^ Initial corpus of transactions
+  -> Int     -- ^ Test limit for this worker
+  -> Maybe Text
+  -> [SolcContract]
+  -> m (WorkerStopReason, WorkerState)
+runWorker True callback vm _ dict workerId initialCorpus _ name cs = runSymWorker callback vm dict workerId initialCorpus name cs
+runWorker False callback vm world dict workerId initialCorpus testLimit _ _ = runFuzzWorker callback vm world dict workerId initialCorpus testLimit
+
+runSymWorker
+  :: (MonadIO m, MonadThrow m, MonadReader Env m)
+  => StateT WorkerState m ()
+  -- ^ Callback to run after each state update (for instrumentation)
+  -> VM RealWorld -- ^ Initial VM state
+  -> GenDict -- ^ Generation dictionary
+  -> Int     -- ^ Worker id starting from 0
+  -> [(FilePath, [Tx])]
+  -- ^ Initial corpus of transactions
+  -> Maybe Text
+  -> [SolcContract]
+  -> m (WorkerStopReason, WorkerState)
+runSymWorker callback vm dict workerId initialCorpus name cs = do
+  cfg <- asks (.cfg)
+  let threadsLeft = getNFuzzWorkers cfg.campaignConf
+
+  continueLoopMVar <- liftIO $ newMVar ()
+  threadsLeftRef <- liftIO $ newIORef threadsLeft
+  newCovTxs <- liftIO $ newIORef ([] : map snd initialCorpus)
+  txsToApplyToState <- liftIO $ newIORef []
+  let objs = (continueLoopMVar, threadsLeftRef, newCovTxs, txsToApplyToState)
+
+  _ <- spawnListener (listenerFunc objs)
+
+  flip runStateT initialState $
+    flip evalRandT (mkStdGen effectiveSeed) $ do
+      lift callback
+      void $ replayCorpus vm initialCorpus
+      run objs
+
+  where
+
+  effectiveSeed = dict.defSeed + workerId
+  effectiveGenDict = dict { defSeed = effectiveSeed }
+  initialState =
+    WorkerState { workerId
+                , gasInfo = mempty
+                , genDict = effectiveGenDict
+                , newCoverage = False
+                , ncallseqs = 0
+                , ncalls = 0
+                , runningThreads = []
+                }
+
+  enqueueIORef ref x = atomicModifyIORef' ref (\q -> (q ++ [x], ()))
+
+  dequeueAllIORef ref = atomicModifyIORef' ref ([],)
+
+  dequeueIORef ref = atomicModifyIORef' ref
+    (\case
+      [] -> ([], Nothing)
+      (h:t) -> (t, Just h))
+
+  listenerFunc (continueLoopMVar, _, newCovTxs, txsToApplyToState) (_, WorkerEvent _ (NewCoverage {transactions})) = do
+    enqueueIORef newCovTxs transactions
+    enqueueIORef txsToApplyToState transactions
+    void $ tryPutMVar continueLoopMVar ()
+  listenerFunc (continueLoopMVar, threadsLeftRef, _, _) (_, WorkerEvent _ (WorkerStopped _)) = do
+    newThreadsLeft <- atomicModifyIORef' threadsLeftRef (\n -> (n-1, n-1))
+    when (newThreadsLeft <= 0) $ void $ tryPutMVar continueLoopMVar ()
+  listenerFunc _ _ = pure ()
+
+  run objs@(continueLoopMVar, threadsLeftRef, newCovTxs, txsToApplyToState) = do
+    liftIO $ takeMVar continueLoopMVar
+    mapM_ (callseq vm) =<< liftIO (dequeueAllIORef txsToApplyToState)
+    liftIO (dequeueIORef newCovTxs) >>= \case
+      Nothing -> do
+        -- no more txs for the moment. if everyone else is done, we can finish too
+        threadsLeft <- liftIO (readIORef threadsLeftRef)
+        if threadsLeft <= 0
+          then pure TestLimitReached
+          else continue
+      Just txs -> do
+        symexecTxs txs
+        liftIO $ void $ tryPutMVar continueLoopMVar ()
+        continue
+    where
+    continue = lift callback >> run objs
+
+  symexecTxs txs = do
+    env <- ask
+    vm' <- foldlM (\vm' tx -> snd <$> execTx vm' tx) vm txs
+    (threadId, symTxsChan) <- liftIO $ createSymTx env name cs vm'
+
+    modify' (\ws -> ws { runningThreads = [threadId] })
+    lift callback
+
+    symTxs <- liftIO $ takeMVar symTxsChan
+
+    modify' (\ws -> ws { runningThreads = [] })
+    lift callback
+
+    mapM_ (\symTx -> void $ callseq vm (txs ++ [symTx])) symTxs
 
 -- | Run a fuzzing campaign given an initial universe state, some tests, and an
 -- optional dictionary to generate calls with. Return the 'Campaign' state once
 -- we can't solve or shrink anything.
-runWorker
-  :: (MonadIO m, MonadThrow m, MonadRandom m, MonadReader Env m)
+runFuzzWorker
+  :: (MonadIO m, MonadThrow m, MonadReader Env m)
   => StateT WorkerState m ()
   -- ^ Callback to run after each state update (for instrumentation)
   -> VM RealWorld -- ^ Initial VM state
   -> World   -- ^ Initial world state
   -> GenDict -- ^ Generation dictionary
   -> Int     -- ^ Worker id starting from 0
-  -> [[Tx]]  -- ^ Initial corpus of transactions
+  -> [(FilePath, [Tx])]
+  -- ^ Initial corpus of transactions
   -> Int     -- ^ Test limit for this worker
   -> m (WorkerStopReason, WorkerState)
-runWorker callback vm world dict workerId initialCorpus testLimit = do
-  metaCacheRef <- asks (.metadataCache)
-  fetchContractCacheRef <- asks (.fetchContractCache)
-  external <- liftIO $ Map.mapMaybe id <$> readIORef fetchContractCacheRef
-  let concretizeKeys = Map.foldrWithKey (Map.insert . forceAddr) mempty
-  liftIO $ writeIORef metaCacheRef (mkMemo (concretizeKeys vm.env.contracts <> external))
-
+runFuzzWorker callback vm world dict workerId initialCorpus testLimit = do
   let
     effectiveSeed = dict.defSeed + workerId
     effectiveGenDict = dict { defSeed = effectiveSeed }
@@ -102,6 +219,7 @@ runWorker callback vm world dict workerId initialCorpus testLimit = do
                   , newCoverage = False
                   , ncallseqs = 0
                   , ncalls = 0
+                  , runningThreads = []
                   }
 
   flip runStateT initialState $ do
@@ -152,8 +270,6 @@ runWorker callback vm world dict workerId initialCorpus testLimit = do
 
   continue = runUpdate (shrinkTest vm) >> lift callback >> run
 
-  mkMemo = makeBytecodeCache . map (forceBuf . fromJust . (^. bytecode)) . Map.elems
-
 -- | Generate a new sequences of transactions, either using the corpus or with
 -- randomly created transactions
 randseq
@@ -163,18 +279,16 @@ randseq
   -> m [Tx]
 randseq deployedContracts world = do
   env <- ask
-  memo <- liftIO $ readIORef env.metadataCache
 
   let
     mutConsts = env.cfg.campaignConf.mutConsts
-    txConf = env.cfg.txConf
     seqLen = env.cfg.campaignConf.seqLen
 
   -- TODO: include reproducer when optimizing
   --let rs = filter (not . null) $ map (.testReproducer) $ ca._tests
 
   -- Generate new random transactions
-  randTxs <- replicateM seqLen (genTx memo world txConf deployedContracts)
+  randTxs <- replicateM seqLen (genTx world deployedContracts)
   -- Generate a random mutator
   cmut <- if seqLen == 1 then seqMutatorsStateless (fromConsts mutConsts)
                          else seqMutatorsStateful (fromConsts mutConsts)
@@ -218,7 +332,11 @@ callseq vm txSeq = do
 
     cov <- liftIO . readIORef =<< asks (.coverageRef)
     points <- liftIO $ scoveragePoints cov
-    pushEvent (NewCoverage points (length cov) newSize)
+    pushWorkerEvent NewCoverage { points
+                                , numCodehashes = length cov
+                                , corpusSize = newSize
+                                , transactions = fst <$> results
+                                }
 
   modify' $ \workerState ->
 
@@ -380,10 +498,10 @@ updateTest vmForShrink (vm, xs) test = do
         test' = updateOpenTest test xs (testValue, vm', results)
       case test'.state of
         Large _ -> do
-          pushEvent (TestFalsified test')
+          pushWorkerEvent (TestFalsified test')
           pure (Just test')
         _ | test'.value > test.value -> do
-          pushEvent (TestOptimized test')
+          pushWorkerEvent (TestOptimized test')
           pure (Just test')
         _ -> pure Nothing
     Large _ ->
@@ -393,12 +511,46 @@ updateTest vmForShrink (vm, xs) test = do
       shrinkTest vmForShrink test
     _ -> pure Nothing
 
-pushEvent
+pushWorkerEvent
   :: (MonadReader Env m, MonadState WorkerState m, MonadIO m)
-  => CampaignEvent
+  => WorkerEvent
   -> m ()
-pushEvent event = do
+pushWorkerEvent event = do
   workerId <- gets (.workerId)
+  env <- ask
+  liftIO $ pushCampaignEvent env (WorkerEvent workerId event)
+
+pushCampaignEvent :: Env -> CampaignEvent -> IO ()
+pushCampaignEvent env event = do
   time <- liftIO getTimestamp
-  chan <- asks (.eventQueue)
-  liftIO $ writeChan chan (workerId, time, event)
+  writeChan env.eventQueue (time, event)
+
+-- | Listener reads events and runs the given 'handler' function. It exits after
+-- receiving all 'WorkerStopped' events and sets the returned 'MVar' so the
+-- parent thread can safely block on listener until all events are processed.
+--
+-- NOTE: because the 'Failure' event does not come from a specific fuzzing worker
+-- it is possible that a listener won't process it if emitted after all workers
+-- are stopped. This is quite unlikely and non-critical but should be addressed
+-- in the long term.
+spawnListener
+  :: (MonadReader Env m, MonadIO m)
+  => ((LocalTime, CampaignEvent) -> IO ())
+  -- ^ a function that handles the events
+  -> m (MVar ())
+spawnListener handler = do
+  cfg <- asks (.cfg)
+  let nworkers = getNWorkers cfg.campaignConf
+  eventQueue <- asks (.eventQueue)
+  chan <- liftIO $ dupChan eventQueue
+  stopVar <- liftIO newEmptyMVar
+  liftIO $ void $ forkFinally (loop chan nworkers) (const $ putMVar stopVar ())
+  pure stopVar
+  where
+  loop chan !workersAlive =
+    when (workersAlive > 0) $ do
+      event <- readChan chan
+      handler event
+      case event of
+        (_, WorkerEvent _ (WorkerStopped _)) -> loop chan (workersAlive - 1)
+        _                                    -> loop chan workersAlive

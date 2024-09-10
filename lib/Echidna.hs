@@ -1,8 +1,9 @@
 module Echidna where
 
+import Control.Concurrent (newChan)
 import Control.Monad.Catch (MonadThrow(..))
 import Control.Monad.ST (RealWorld)
-import Data.IORef (writeIORef)
+import Data.IORef (writeIORef, newIORef)
 import Data.List (find)
 import Data.List.NonEmpty (NonEmpty)
 import Data.List.NonEmpty qualified as NE
@@ -12,7 +13,9 @@ import System.FilePath ((</>))
 
 import EVM (cheatCode)
 import EVM.ABI (AbiValue(AbiAddress))
-import EVM.Solidity (SolcContract(..))
+import EVM.Dapp (DappInfo(..), dappInfo)
+import EVM.Fetch qualified
+import EVM.Solidity (SolcContract(..), BuildOutput)
 import EVM.Types hiding (Env)
 
 import Echidna.ABI
@@ -43,15 +46,15 @@ import Echidna.Types.World
 -- * A prepopulated dictionary
 prepareContract
   :: Env
-  -> [SolcContract]
   -> NonEmpty FilePath
   -> Maybe ContractName
   -> Seed
   -> IO (VM RealWorld, World, GenDict)
-prepareContract env contracts solFiles specifiedContract seed = do
+prepareContract env solFiles specifiedContract seed = do
   let solConf = env.cfg.solConf
+      contracts = Map.elems env.dapp.solcByName
 
-  -- compile and load contracts
+  -- deploy contracts
   (vm, funs, testNames, signatureMap) <- loadSpecified env specifiedContract contracts
 
   -- run processors
@@ -89,7 +92,7 @@ prepareContract env contracts solFiles specifiedContract seed = do
   writeIORef env.testsRef echidnaTests
   pure (vm, world, dict)
 
-loadInitialCorpus :: Env -> World -> IO [[Tx]]
+loadInitialCorpus :: Env -> World -> IO [(FilePath, [Tx])]
 loadInitialCorpus env world = do
   -- load transactions from init sequence (if any)
   let sigs = Set.fromList $ concatMap NE.toList (Map.elems world.highSignatureMap)
@@ -98,7 +101,7 @@ loadInitialCorpus env world = do
       Nothing -> pure []
       Just dir -> do
         ethenos <- loadEtheno dir
-        pure [extractFromEtheno ethenos sigs]
+        pure [(dir, extractFromEtheno ethenos sigs)]
 
   persistedCorpus <-
     case env.cfg.campaignConf.corpusDir of
@@ -109,3 +112,19 @@ loadInitialCorpus env world = do
         pure (ctxs1 ++ ctxs2)
 
   pure $ persistedCorpus ++ ethenoCorpus
+
+mkEnv :: EConfig -> BuildOutput -> IO Env
+mkEnv cfg buildOutput = do
+  fetchContractCache <- newIORef mempty
+  fetchSlotCache <- newIORef mempty
+  codehashMap <- newIORef mempty
+  chainId <- maybe (pure Nothing) EVM.Fetch.fetchChainIdFrom cfg.rpcUrl
+  eventQueue <- newChan
+  coverageRef <- newIORef mempty
+  corpusRef <- newIORef mempty
+  testsRef <- newIORef mempty
+  -- TODO put in real path
+  let dapp = dappInfo "/" buildOutput
+  pure $ Env { cfg, dapp, codehashMap, fetchContractCache, fetchSlotCache
+             , chainId, eventQueue, coverageRef, corpusRef, testsRef
+             }

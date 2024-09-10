@@ -12,11 +12,11 @@ import Data.Word (Word64)
 import EVM.Dapp (DappInfo)
 import EVM.Types (Addr, Contract, W256)
 
+import Echidna.SourceMapping (CodehashMap)
 import Echidna.Types.Campaign (CampaignConf, CampaignEvent)
 import Echidna.Types.Corpus (Corpus)
 import Echidna.Types.Coverage (CoverageMap)
-import Echidna.Types.Signature (MetadataCache)
-import Echidna.Types.Solidity (SolConf)
+import Echidna.Types.Solidity (SolConf(..))
 import Echidna.Types.Test (TestConf, EchidnaTest)
 import Echidna.Types.Tx (TxConf)
 
@@ -65,13 +65,13 @@ data Env = Env
 
   -- | Shared between all workers. Events are fairly rare so contention is
   -- minimal.
-  , eventQueue :: Chan (Int, LocalTime, CampaignEvent)
+  , eventQueue :: Chan (LocalTime, CampaignEvent)
 
   , testsRef :: IORef [EchidnaTest]
   , coverageRef :: IORef CoverageMap
   , corpusRef :: IORef Corpus
 
-  , metadataCache :: IORef MetadataCache
+  , codehashMap :: CodehashMap
   , fetchContractCache :: IORef (Map Addr (Maybe Contract))
   , fetchSlotCache :: IORef (Map Addr (Map W256 (Maybe W256)))
   , chainId :: Maybe W256
